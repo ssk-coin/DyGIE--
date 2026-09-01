@@ -1,5 +1,5 @@
 """
-DyGIE++ Standalone — Dataset
+DyGIE-- Standalone — Dataset
 SciERC / DyGIE++ JSON Lines 形式を読み込み、PyTorch Dataset として提供します。
 
 各行の形式:
