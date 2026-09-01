@@ -1,0 +1,30 @@
+{
+  "transformer_model": "bert-base-cased",
+  "max_span_width": 8,
+  "max_total_length": 512,
+
+  "use_ner":   true,
+  "use_rel":   true,
+  "use_coref": true,
+
+  "ner_loss_weight":   1.0,
+  "rel_loss_weight":   1.0,
+  "coref_loss_weight": 1.0,
+  "use_gold_spans_for_rel": true,
+
+  "width_embedding_dim":  128,
+  "feedforward_dim":      150,
+  "use_attentive_pooling": true,
+  "spans_per_word":       0.4,
+  "max_top_antecedents":  50,
+  "dropout":              0.4,
+
+  "num_epochs":      20,
+  "batch_size":       4,
+  "lr_transformer": 2e-5,
+  "lr_task":        1e-4,
+  "warmup_steps":   200,
+  "max_grad_norm":  1.0,
+  "num_workers":      0,
+  "log_every":       50
+}

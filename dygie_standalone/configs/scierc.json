@@ -1,0 +1,44 @@
+{
+  "transformer_model": "allenai/scibert_scivocab_cased",
+  "max_span_width": 8,
+  "max_total_length": 512,
+
+  "use_ner":   true,
+  "use_rel":   true,
+  "use_coref": true,
+
+  "ner_loss_weight":   1.0,
+  "rel_loss_weight":   1.0,
+  "coref_loss_weight": 1.0,
+  "use_gold_spans_for_rel": true,
+
+  "width_embedding_dim":  128,
+  "feedforward_dim":      150,
+  "use_attentive_pooling": true,
+  "spans_per_word":       0.4,
+  "max_top_antecedents":  50,
+  "dropout":              0.4,
+
+  "num_epochs":      20,
+  "batch_size":       4,
+  "lr_transformer": 1e-5,
+  "lr_task":        1e-4,
+  "warmup_steps":   200,
+  "max_grad_norm":  1.0,
+  "num_workers":      0,
+  "log_every":       50,
+
+  "_comment_新機能": "以下は v2 で追加されたオプション",
+  "use_amp": false,
+  "_comment_use_amp": "true にすると自動混合精度 (AMP) を有効化。CUDA 環境のみ有効。学習速度向上・GPU メモリ削減。",
+
+  "patience": 5,
+  "_comment_patience": "Early stopping の待機エポック数。0 で無効（全エポック学習）。",
+
+  "gradient_accumulation_steps": 1,
+  "_comment_gradient_accumulation_steps": "勾配蓄積ステップ数。バッチサイズを増やせない場合に実効バッチサイズを増やす。例: 4 なら実効バッチサイズは batch_size × 4。",
+
+  "_comment_ner_labels": "自動収集されます。手動指定したい場合は下記のコメントを外してください。",
+  "_ner_labels_example": ["Task", "Method", "Metric", "Material", "OtherScientificTerm", "Generic"],
+  "_rel_labels_example": ["Used-for", "Feature-of", "Hyponym-of", "Part-of", "Compare", "Conjunction", "Evaluate-for", "Coref-of"]
+}
