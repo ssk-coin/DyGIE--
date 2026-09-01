@@ -1,5 +1,5 @@
 """
-DyGIE++ Standalone — Relation Extraction Module
+DyGIE-- Standalone — Relation Extraction Module
 
 NER で検出されたエンティティスパンのペアに対して関係ラベルを分類する。
 学習時は gold NER スパンを使用し、推論時は predicted NER スパンを使用する。
