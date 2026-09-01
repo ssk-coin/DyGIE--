@@ -14,6 +14,8 @@ AllenNLP の Trainer を置き換える純粋な PyTorch 学習ループ。
   - AMP (自動混合精度) 学習サポート (use_amp=True, CUDA 環境のみ)
   - Early stopping サポート (patience > 0 で有効)
   - Gradient accumulation サポート (gradient_accumulation_steps > 1 で有効)
+  - Early stopping ウォームアップ: early_stopping_warmup エポック中は
+    patience カウンタを増加させず、安定前の停止を防ぐ
 """
 
 from __future__ import annotations
@@ -63,6 +65,10 @@ class Trainer:
     patience : int
         Early stopping の待機エポック数。0 で無効（常に全エポック学習）。
         dev スコアが patience エポック改善しない場合に学習を停止する。
+    early_stopping_warmup : int
+        Early stopping を有効化するまでのウォームアップエポック数（デフォルト 20）。
+        最初のこのエポック数の間は patience カウンタを増加させない。
+        学習初期のスコアが不安定な期間に誤って停止するのを防ぐ。
     gradient_accumulation_steps : int
         勾配蓄積ステップ数。1 で通常通り毎ステップ更新。
         メモリが少ない環境で実効バッチサイズを増やすために使用する。
@@ -84,6 +90,7 @@ class Trainer:
         log_every: int = 50,
         use_amp: bool = False,
         patience: int = 0,
+        early_stopping_warmup: int = 20,
         gradient_accumulation_steps: int = 1,
     ) -> None:
         self.model = model
@@ -96,6 +103,7 @@ class Trainer:
         self.use_gold_spans_for_rel = use_gold_spans_for_rel
         self.log_every = log_every
         self.patience = patience
+        self.early_stopping_warmup = max(0, early_stopping_warmup)
         self.gradient_accumulation_steps = max(1, gradient_accumulation_steps)
 
         # device
@@ -176,21 +184,33 @@ class Trainer:
                 self._save_checkpoint("best")
                 logger.info("  ↑ New best score: %.4f", score)
             else:
-                self._patience_counter += 1
-                logger.info(
-                    "  No improvement. Patience: %d/%d",
-                    self._patience_counter,
-                    self.patience if self.patience > 0 else float("inf"),
-                )
+                # ウォームアップ期間中は patience カウンタを増加させない
+                if epoch > self.early_stopping_warmup:
+                    self._patience_counter += 1
+                    logger.info(
+                        "  No improvement. Patience: %d/%d",
+                        self._patience_counter,
+                        self.patience if self.patience > 0 else float("inf"),
+                    )
+                else:
+                    logger.info(
+                        "  No improvement (warmup epoch %d/%d — patience not counted).",
+                        epoch,
+                        self.early_stopping_warmup,
+                    )
 
             self._save_checkpoint("last")
 
-            # Early stopping
-            if self.patience > 0 and self._patience_counter >= self.patience:
+            # Early stopping（ウォームアップ期間後のみ判定）
+            if (
+                self.patience > 0
+                and epoch > self.early_stopping_warmup
+                and self._patience_counter >= self.patience
+            ):
                 logger.info(
-                    "Early stopping triggered at epoch %d (patience=%d). "
+                    "Early stopping triggered at epoch %d (patience=%d, warmup=%d). "
                     "Best score: %.4f",
-                    epoch, self.patience, self.best_dev_score,
+                    epoch, self.patience, self.early_stopping_warmup, self.best_dev_score,
                 )
                 break
 

@@ -35,6 +35,9 @@
   "patience": 5,
   "_comment_patience": "Early stopping の待機エポック数。0 で無効（全エポック学習）。",
 
+  "early_stopping_warmup": 20,
+  "_comment_early_stopping_warmup": "Early stopping を開始するまでのウォームアップエポック数。最初のこのエポック数の間は patience カウンタを増加させない。学習初期のスコアが不安定な期間に誤って停止するのを防ぐ。",
+
   "gradient_accumulation_steps": 1,
   "_comment_gradient_accumulation_steps": "勾配蓄積ステップ数。バッチサイズを増やせない場合に実効バッチサイズを増やす。例: 4 なら実効バッチサイズは batch_size × 4。",
 
