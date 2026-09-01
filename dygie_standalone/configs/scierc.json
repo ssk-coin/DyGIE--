@@ -46,6 +46,23 @@
   "max_spans": 0,
   "_comment_max_spans": "文書あたりの最大スパン数（0=上限なし）。RE の K×K ペア行列のメモリを削減する。例: 800 に設定すると K を 800 に制限。エンティティが多い文書には 1000〜1500 が推奨。",
 
+  "_comment_re_v4": "=== RE スコア改善オプション (v4) ===",
+
+  "type_embedding_dim": 128,
+  "_comment_type_embedding_dim": "エンティティタイプ埋め込みの次元数。RE ペア表現に NER ラベル情報を追加する（最大の改善効果）。0 で無効。SciERC のような multi-type データに特に有効。",
+
+  "use_distance_feature": true,
+  "_comment_use_distance_feature": "スパン間距離特徴を RE ペア表現に追加する。近距離のエンティティペアほど関係ありの確率が高い傾向を学習できる。",
+
+  "num_distance_buckets": 10,
+  "_comment_num_distance_buckets": "距離バケット数（ログスケール）。デフォルトの 10 は: 0, 1-2, 3-6, 7-14, 15-30, 31-62, 63-126, 127-254, 255-510, 511+ トークンのバケット。",
+
+  "distance_embedding_dim": 64,
+  "_comment_distance_embedding_dim": "距離埋め込みの次元数。0 で use_distance_feature=true でも無効化。",
+
+  "focal_loss_gamma": 2.0,
+  "_comment_focal_loss_gamma": "RE Focal Loss の gamma パラメータ。0 で通常の CrossEntropyLoss。2.0 が標準的な値。SciERC の RE は「関係なし」が多数派のため focal loss が効果的。",
+
   "_comment_ner_labels": "自動収集されます。手動指定したい場合は下記のコメントを外してください。",
   "_ner_labels_example": ["Task", "Method", "Metric", "Material", "OtherScientificTerm", "Generic"],
   "_rel_labels_example": ["Used-for", "Feature-of", "Hyponym-of", "Part-of", "Compare", "Conjunction", "Evaluate-for", "Coref-of"]

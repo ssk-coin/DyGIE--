@@ -62,6 +62,17 @@ def parse_args() -> argparse.Namespace:
                    help="Transformer エンコーダに勾配チェックポイントを適用（メモリ削減）")
     p.add_argument("--max_spans",         type=int,   default=None,
                    help="文書あたりの最大スパン数（0=上限なし）。RE の K×K メモリを削減する。")
+    # RE スコア改善オプション (v4)
+    p.add_argument("--type_embedding_dim", type=int,   default=None,
+                   help="RE エンティティタイプ埋め込みの次元数（0=無効）")
+    p.add_argument("--use_distance_feature", action="store_true", default=None,
+                   help="RE スパン間距離特徴を有効化")
+    p.add_argument("--num_distance_buckets", type=int,   default=None,
+                   help="距離バケット数（デフォルト 10）")
+    p.add_argument("--distance_embedding_dim", type=int,   default=None,
+                   help="距離埋め込みの次元数（0=無効）")
+    p.add_argument("--focal_loss_gamma",  type=float, default=None,
+                   help="RE Focal Loss の gamma 値（0=通常の CE、2.0 が推奨）")
     return p.parse_args()
 
 
@@ -74,7 +85,9 @@ def main() -> None:
     # CLI 引数で設定を上書き
     for key in ["transformer_model", "num_epochs", "batch_size",
                 "lr_transformer", "lr_task", "device",
-                "patience", "gradient_accumulation_steps", "max_spans"]:
+                "patience", "gradient_accumulation_steps", "max_spans",
+                "type_embedding_dim", "num_distance_buckets",
+                "distance_embedding_dim", "focal_loss_gamma"]:
         val = getattr(args, key, None)
         if val is not None:
             cfg[key] = val
@@ -83,6 +96,8 @@ def main() -> None:
         cfg["use_amp"] = True
     if args.use_gradient_checkpointing:
         cfg["use_gradient_checkpointing"] = True
+    if args.use_distance_feature:
+        cfg["use_distance_feature"] = True
 
     logger.info("Config: %s", json.dumps(cfg, indent=2, ensure_ascii=False))
 
@@ -148,6 +163,12 @@ def main() -> None:
         max_top_antecedents=cfg.get("max_top_antecedents", 50),
         dropout=cfg.get("dropout", 0.4),
         use_gradient_checkpointing=cfg.get("use_gradient_checkpointing", False),
+        # v4: RE スコア改善
+        type_embedding_dim=cfg.get("type_embedding_dim", 0),
+        use_distance_feature=cfg.get("use_distance_feature", False),
+        num_distance_buckets=cfg.get("num_distance_buckets", 10),
+        distance_embedding_dim=cfg.get("distance_embedding_dim", 64),
+        focal_loss_gamma=cfg.get("focal_loss_gamma", 0.0),
     )
 
     # ---- Trainer ----

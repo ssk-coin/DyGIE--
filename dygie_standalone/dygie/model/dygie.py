@@ -20,6 +20,12 @@ AllenNLP には一切依存しません。
   - use_gradient_checkpointing=True で Transformer エンコーダに勾配チェックポイントを
     適用。エンコーダの活性化メモリを約 50〜70% 削減（学習速度は約 1.3x 低下）。
   - RE モジュールを K×K → E×E（エンティティスパンのみ）に変更済み。
+
+RE スコア改善 (v4):
+  - エンティティタイプ埋め込みを RE ペア表現に追加（type_embedding_dim で制御）
+  - スパン間距離特徴（use_distance_feature / distance_embedding_dim で制御）
+  - Focal Loss による RE クラス不均衡への対処（focal_loss_gamma で制御）
+  - Pair MLP を 2 層 + LayerNorm に深化
 """
 
 from __future__ import annotations
@@ -67,6 +73,16 @@ class DyGIE(nn.Module):
         Coref mention pruning の割合。
     max_top_antecedents : int
     dropout : float
+    type_embedding_dim : int
+        RE エンティティタイプ埋め込みの次元 (0 で無効)。
+    use_distance_feature : bool
+        RE スパン間距離特徴を使用するか。
+    num_distance_buckets : int
+        距離バケット数。
+    distance_embedding_dim : int
+        距離埋め込みの次元 (0 で無効)。
+    focal_loss_gamma : float
+        RE Focal Loss の gamma 値 (0 で通常の CE)。
     """
 
     def __init__(
@@ -88,6 +104,11 @@ class DyGIE(nn.Module):
         max_top_antecedents: int = 50,
         dropout: float = 0.4,
         use_gradient_checkpointing: bool = False,
+        type_embedding_dim: int = 0,
+        use_distance_feature: bool = False,
+        num_distance_buckets: int = 10,
+        distance_embedding_dim: int = 64,
+        focal_loss_gamma: float = 0.0,
     ) -> None:
         super().__init__()
 
@@ -119,6 +140,12 @@ class DyGIE(nn.Module):
             "max_top_antecedents": max_top_antecedents,
             "dropout": dropout,
             "use_gradient_checkpointing": use_gradient_checkpointing,
+            # v4: RE スコア改善
+            "type_embedding_dim": type_embedding_dim,
+            "use_distance_feature": use_distance_feature,
+            "num_distance_buckets": num_distance_buckets,
+            "distance_embedding_dim": distance_embedding_dim,
+            "focal_loss_gamma": focal_loss_gamma,
         }
 
         # ---- Transformer encoder ----
@@ -156,8 +183,14 @@ class DyGIE(nn.Module):
             self.rel_module = RelationModule(
                 span_dim=span_dim,
                 num_rel_labels=len(rel_labels),
+                num_ner_labels=len(ner_labels) if (use_ner and ner_labels) else 0,
                 feedforward_dim=feedforward_dim,
                 dropout=dropout,
+                type_embedding_dim=type_embedding_dim,
+                use_distance_feature=use_distance_feature,
+                num_distance_buckets=num_distance_buckets,
+                distance_embedding_dim=distance_embedding_dim,
+                focal_loss_gamma=focal_loss_gamma,
             )
         else:
             self.rel_module = None  # type: ignore
@@ -256,6 +289,7 @@ class DyGIE(nn.Module):
                 ner_preds=output["ner_preds"],
                 rel_labels=rel_labels,
                 ner_labels=ner_labels,
+                spans=spans,                   # 距離特徴量のためにスパン位置を渡す
                 use_gold_spans=use_gold_spans,
             )
             output.update(rel_out)

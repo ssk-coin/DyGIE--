@@ -340,6 +340,74 @@ def test_backward():
     print(f"  [OK] Backward pass: loss={loss.item():.4f}")
 
 
+def test_re_v4_features():
+    """
+    v4 RE 改善: エンティティタイプ埋め込み / 距離特徴 / Focal Loss が
+    正しく動作し、損失が NaN でないことを確認する。
+    """
+    tok = _TOK
+    ds = DyGIEDataset(SAMPLE, tok, max_span_width=4, max_total_length=128)
+    loader = DataLoader(ds, batch_size=2, collate_fn=collate_fn)
+    batch = next(iter(loader))
+
+    # 全 v4 機能を有効化
+    model = DyGIE(
+        transformer_model=MODEL_NAME,
+        ner_labels=ds.ner_labels,
+        rel_labels=ds.rel_labels,
+        max_span_width=4,
+        use_ner=True,
+        use_rel=True,
+        use_coref=False,
+        feedforward_dim=64,
+        width_embedding_dim=32,
+        dropout=0.0,
+        # v4
+        type_embedding_dim=32,       # エンティティタイプ埋め込み
+        use_distance_feature=True,   # 距離特徴
+        num_distance_buckets=10,
+        distance_embedding_dim=16,
+        focal_loss_gamma=2.0,        # Focal Loss
+    )
+    model.eval()
+
+    with torch.no_grad():
+        out = model(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            token_to_subword=batch["token_to_subword"],
+            spans=batch["spans"],
+            span_mask=batch["span_mask"],
+            num_tokens=batch["num_tokens"],
+            ner_labels=batch["ner_labels"],
+            rel_labels=batch["rel_labels"],
+            use_gold_spans=True,
+        )
+
+    assert "loss" in out, "loss missing"
+    assert not out["loss"].isnan().item(), "loss is NaN with v4 features"
+    assert "rel_preds" in out
+    assert "pair_mask" in out
+
+    # backward も確認
+    model.train()
+    out2 = model(
+        input_ids=batch["input_ids"],
+        attention_mask=batch["attention_mask"],
+        token_to_subword=batch["token_to_subword"],
+        spans=batch["spans"],
+        span_mask=batch["span_mask"],
+        num_tokens=batch["num_tokens"],
+        ner_labels=batch["ner_labels"],
+        rel_labels=batch["rel_labels"],
+        use_gold_spans=True,
+    )
+    out2["loss"].backward()
+
+    print(f"  [OK] RE v4 features: loss={out['loss'].item():.4f} | "
+          f"pair_mask nonzero={out['pair_mask'].sum().item():.0f} pairs")
+
+
 def test_coref_distance_embedding():
     """
     coref の antecedent 距離埋め込みが正しく適用されているか確認する。
@@ -395,6 +463,7 @@ if __name__ == "__main__":
         ("Coref P/R independence",            test_coref_metrics_precision_recall_independence),
         ("Save / Load pretrained",            test_save_load_pretrained),
         ("Backward pass",                     test_backward),
+        ("RE v4 features",                    test_re_v4_features),
         ("Coref distance embedding",          test_coref_distance_embedding),
     ]
     print("\n===== DyGIE++ Standalone Smoke Tests =====")
