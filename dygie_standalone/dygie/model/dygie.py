@@ -1,0 +1,344 @@
+"""
+DyGIE++ Standalone — メインモデル
+
+Transformer エンコーダ + スパン抽出 + NER / RE / Coref ヘッドを統合します。
+AllenNLP には一切依存しません。
+
+設計方針:
+  - バッチ内でスパン数が異なるため、span_mask でパディングを管理
+  - 学習時は gold NER スパンで RE を計算（use_gold_spans=True）
+  - 推論時は predicted NER スパンで RE を計算
+  - 損失の合計は各タスクの重み付き和
+
+改善点 (v2):
+  - save_pretrained / from_pretrained が dygie_config.json に DyGIE 固有の
+    ハイパーパラメータを保存・復元するように対応。
+    モデルのロードに kwargs を全て手動で指定する必要がなくなった。
+  - torch.load に weights_only=True を追加（セキュリティ改善・PyTorch 警告抑制）
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from pathlib import Path
+from typing import Any
+
+import torch
+import torch.nn as nn
+from transformers import AutoModel, AutoConfig
+
+from .span_extractor import SpanExtractor
+from .ner_module import NERModule
+from .rel_module import RelationModule
+from .coref_module import CorefModule
+
+logger = logging.getLogger(__name__)
+
+
+class DyGIE(nn.Module):
+    """
+    Parameters
+    ----------
+    transformer_model : str
+        HuggingFace モデル名またはローカルパス。
+        例: "bert-base-cased", "allenai/scibert_scivocab_cased"
+    ner_labels : list[str]
+        NER ラベル一覧（"no entity" を除く）。
+    rel_labels : list[str]
+        Relation ラベル一覧（"no relation" を除く）。
+    max_span_width : int
+        最大スパン幅（トークン数）。
+    use_ner : bool
+    use_rel : bool
+    use_coref : bool
+    ner_loss_weight : float
+    rel_loss_weight : float
+    coref_loss_weight : float
+    width_embedding_dim : int
+    feedforward_dim : int
+    use_attentive_pooling : bool
+    spans_per_word : float
+        Coref mention pruning の割合。
+    max_top_antecedents : int
+    dropout : float
+    """
+
+    def __init__(
+        self,
+        transformer_model: str,
+        ner_labels: list[str],
+        rel_labels: list[str],
+        max_span_width: int = 8,
+        use_ner: bool = True,
+        use_rel: bool = True,
+        use_coref: bool = True,
+        ner_loss_weight: float = 1.0,
+        rel_loss_weight: float = 1.0,
+        coref_loss_weight: float = 1.0,
+        width_embedding_dim: int = 128,
+        feedforward_dim: int = 150,
+        use_attentive_pooling: bool = True,
+        spans_per_word: float = 0.4,
+        max_top_antecedents: int = 50,
+        dropout: float = 0.4,
+    ) -> None:
+        super().__init__()
+
+        self.use_ner = use_ner
+        self.use_rel = use_rel
+        self.use_coref = use_coref
+        self.ner_loss_weight = ner_loss_weight
+        self.rel_loss_weight = rel_loss_weight
+        self.coref_loss_weight = coref_loss_weight
+        self.ner_labels = ner_labels
+        self.rel_labels = rel_labels
+
+        # save_pretrained / from_pretrained 用に初期化パラメータを記録
+        self._init_config: dict[str, Any] = {
+            "transformer_model": transformer_model,
+            "ner_labels": list(ner_labels),
+            "rel_labels": list(rel_labels),
+            "max_span_width": max_span_width,
+            "use_ner": use_ner,
+            "use_rel": use_rel,
+            "use_coref": use_coref,
+            "ner_loss_weight": ner_loss_weight,
+            "rel_loss_weight": rel_loss_weight,
+            "coref_loss_weight": coref_loss_weight,
+            "width_embedding_dim": width_embedding_dim,
+            "feedforward_dim": feedforward_dim,
+            "use_attentive_pooling": use_attentive_pooling,
+            "spans_per_word": spans_per_word,
+            "max_top_antecedents": max_top_antecedents,
+            "dropout": dropout,
+        }
+
+        # ---- Transformer encoder ----
+        self.encoder = AutoModel.from_pretrained(transformer_model)
+        hidden_size: int = self.encoder.config.hidden_size
+
+        # ---- Span extractor ----
+        self.span_extractor = SpanExtractor(
+            hidden_size=hidden_size,
+            max_span_width=max_span_width,
+            width_embedding_dim=width_embedding_dim,
+            use_attentive_pooling=use_attentive_pooling,
+            dropout=dropout,
+        )
+        span_dim = self.span_extractor.span_dim
+
+        # ---- Task heads ----
+        if use_ner and ner_labels:
+            self.ner_module = NERModule(
+                span_dim=span_dim,
+                num_ner_labels=len(ner_labels),
+                feedforward_dim=feedforward_dim,
+                dropout=dropout,
+            )
+        else:
+            self.ner_module = None  # type: ignore
+
+        if use_rel and rel_labels:
+            self.rel_module = RelationModule(
+                span_dim=span_dim,
+                num_rel_labels=len(rel_labels),
+                feedforward_dim=feedforward_dim,
+                dropout=dropout,
+            )
+        else:
+            self.rel_module = None  # type: ignore
+
+        if use_coref:
+            self.coref_module = CorefModule(
+                span_dim=span_dim,
+                feedforward_dim=feedforward_dim,
+                spans_per_word=spans_per_word,
+                max_top_antecedents=max_top_antecedents,
+                dropout=dropout,
+            )
+        else:
+            self.coref_module = None  # type: ignore
+
+        logger.info(
+            "DyGIE initialized | encoder=%s | NER=%s | RE=%s | Coref=%s | span_dim=%d",
+            transformer_model,
+            use_ner,
+            use_rel,
+            use_coref,
+            span_dim,
+        )
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,           # [B, L]
+        attention_mask: torch.Tensor,      # [B, L]
+        token_to_subword: torch.Tensor,    # [B, N]
+        spans: torch.Tensor,               # [B, K, 2]
+        span_mask: torch.Tensor,           # [B, K]
+        num_tokens: torch.Tensor,          # [B]
+        ner_labels: torch.Tensor | None = None,       # [B, K]
+        rel_labels: torch.Tensor | None = None,       # [B, K, K]
+        coref_clusters: list | None = None,
+        use_gold_spans: bool = True,
+    ) -> dict[str, Any]:
+        """
+        Returns
+        -------
+        dict:
+          loss          : total weighted loss (学習時のみ)
+          ner_loss      : NER loss (学習時のみ)
+          rel_loss      : RE loss (学習時のみ)
+          coref_loss    : Coref loss (学習時のみ)
+          ner_logits    : [B, K, num_ner_labels+1]
+          ner_preds     : [B, K]
+          rel_logits    : [B, K, K, num_rel_labels+1]
+          rel_preds     : [B, K, K]
+          mention_scores      : [B, K]       (coref)
+          top_span_indices    : [B, T]       (coref)
+          antecedent_scores   : [B, T, T+1]  (coref)
+        """
+        # ---- エンコード ----
+        encoder_out = self.encoder(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        )
+        sequence_output: torch.Tensor = encoder_out.last_hidden_state  # [B, L, H]
+
+        # ---- スパン表現抽出 ----
+        span_repr = self.span_extractor(
+            sequence_output=sequence_output,
+            token_to_subword=token_to_subword,
+            spans=spans,
+            span_mask=span_mask,
+        )  # [B, K, span_dim]
+
+        output: dict[str, Any] = {}
+        total_loss = torch.tensor(0.0, device=input_ids.device)
+
+        # ---- NER ----
+        if self.ner_module is not None:
+            ner_out = self.ner_module(
+                span_repr=span_repr,
+                span_mask=span_mask,
+                ner_labels=ner_labels,
+            )
+            output.update(ner_out)
+            if "ner_loss" in ner_out:
+                total_loss = total_loss + self.ner_loss_weight * ner_out["ner_loss"]
+        else:
+            output["ner_preds"] = torch.zeros(
+                span_repr.shape[:2], dtype=torch.long, device=input_ids.device
+            )
+
+        # ---- Relation Extraction ----
+        if self.rel_module is not None:
+            rel_out = self.rel_module(
+                span_repr=span_repr,
+                span_mask=span_mask,
+                ner_preds=output["ner_preds"],
+                rel_labels=rel_labels,
+                ner_labels=ner_labels,
+                use_gold_spans=use_gold_spans,
+            )
+            output.update(rel_out)
+            if "rel_loss" in rel_out:
+                total_loss = total_loss + self.rel_loss_weight * rel_out["rel_loss"]
+
+        # ---- Coreference ----
+        if self.coref_module is not None:
+            coref_out = self.coref_module(
+                span_repr=span_repr,
+                span_mask=span_mask,
+                spans=spans,
+                num_tokens=num_tokens,
+                coref_clusters=coref_clusters,
+            )
+            output.update(coref_out)
+            if "coref_loss" in coref_out:
+                total_loss = total_loss + self.coref_loss_weight * coref_out["coref_loss"]
+
+        if ner_labels is not None or rel_labels is not None or coref_clusters is not None:
+            output["loss"] = total_loss
+
+        return output
+
+    # ------------------------------------------------------------------
+    # Save / Load
+    # ------------------------------------------------------------------
+
+    def save_pretrained(self, output_dir: str | Path) -> None:
+        """モデル全体を output_dir に保存する。
+
+        保存ファイル:
+          model.pt          — PyTorch state dict
+          config.json       — Transformer encoder config
+          dygie_config.json — DyGIE 固有のハイパーパラメータ
+        """
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(self.state_dict(), output_dir / "model.pt")
+        # encoder の config も保存
+        self.encoder.config.save_pretrained(output_dir)
+        # DyGIE 固有の設定を保存
+        with open(output_dir / "dygie_config.json", "w", encoding="utf-8") as f:
+            json.dump(self._init_config, f, indent=2, ensure_ascii=False)
+        logger.info("Model saved to %s", output_dir)
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        model_dir: str | Path,
+        **kwargs: Any,
+    ) -> "DyGIE":
+        """保存済みモデルを読み込む。
+
+        dygie_config.json が存在する場合はそこからハイパーパラメータを復元する。
+        kwargs で個別パラメータを上書きすることも可能。
+
+        読み込み手順:
+          1. dygie_config.json からハイパーパラメータ（transformer_model 名を含む）を復元
+          2. transformer_model 名からエンコーダのアーキテクチャを初期化
+          3. model.pt から fine-tuned 全パラメータをロード（エンコーダ含む）
+
+        NOTE: transformer_model は元の HuggingFace モデル名のまま使用する。
+        model_dir には encoder の HuggingFace 形式の重みファイルは不要。
+        """
+        model_dir = Path(model_dir)
+
+        # DyGIE 固有の設定を読み込む
+        dygie_config_path = model_dir / "dygie_config.json"
+        if dygie_config_path.exists():
+            with open(dygie_config_path, encoding="utf-8") as f:
+                saved_config: dict[str, Any] = json.load(f)
+            # kwargs で上書き（transformer_model の上書きも可能）
+            saved_config.update(kwargs)
+            kwargs = saved_config
+        else:
+            # 旧形式: kwargs に全ハイパーパラメータが必要
+            # transformer_model が未指定の場合のみ model_dir を使う（後方互換）
+            logger.warning(
+                "dygie_config.json not found in %s. "
+                "All DyGIE hyperparameters must be supplied as kwargs.",
+                model_dir,
+            )
+            if "transformer_model" not in kwargs:
+                kwargs["transformer_model"] = str(model_dir)
+
+        # cls(**kwargs) でエンコーダのアーキテクチャを初期化
+        # (transformer_model は元の HuggingFace モデル名 or ローカルパス)
+        model = cls(**kwargs)
+
+        # model.pt から fine-tuned 全パラメータをロード（エンコーダ重みも上書き）
+        state_dict = torch.load(
+            model_dir / "model.pt",
+            map_location="cpu",
+            weights_only=True,
+        )
+        model.load_state_dict(state_dict)
+        logger.info("Model loaded from %s", model_dir)
+        return model
