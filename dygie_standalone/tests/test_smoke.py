@@ -1,5 +1,5 @@
 """
-DyGIE++ Standalone — スモークテスト
+DyGIE-- Standalone — スモークテスト
 フルパイプライン（データ読み込み→モデル forward→損失→デコード→メトリクス）を検証する。
 HuggingFace への外部アクセス不要：ダミーBERTをローカル生成してテストする。
 
