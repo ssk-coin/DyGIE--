@@ -151,11 +151,13 @@ def test_forward_with_loss():
     assert "loss" in out, "loss missing"
     assert not out["loss"].isnan().item(), "loss is NaN"
     assert "ner_logits" in out
-    assert "rel_logits" in out
+    # rel_logits は v3 からメモリ削減のため出力しない（rel_preds / pair_mask を使用）
+    assert "rel_preds" in out
+    assert "pair_mask" in out
     assert "antecedent_scores" in out
     print(f"  [OK] Forward+Loss: loss={out['loss'].item():.4f} | "
           f"ner_logits={tuple(out['ner_logits'].shape)} | "
-          f"rel_logits={tuple(out['rel_logits'].shape)}")
+          f"rel_preds={tuple(out['rel_preds'].shape)}")
 
 
 def test_inference_no_labels():

@@ -57,6 +57,11 @@ def parse_args() -> argparse.Namespace:
                    help="Early stopping のエポック数（0=無効）")
     p.add_argument("--gradient_accumulation_steps", type=int, default=None,
                    help="勾配蓄積ステップ数（デフォルト 1）")
+    # メモリ最適化オプション
+    p.add_argument("--use_gradient_checkpointing", action="store_true", default=None,
+                   help="Transformer エンコーダに勾配チェックポイントを適用（メモリ削減）")
+    p.add_argument("--max_spans",         type=int,   default=None,
+                   help="文書あたりの最大スパン数（0=上限なし）。RE の K×K メモリを削減する。")
     return p.parse_args()
 
 
@@ -69,13 +74,15 @@ def main() -> None:
     # CLI 引数で設定を上書き
     for key in ["transformer_model", "num_epochs", "batch_size",
                 "lr_transformer", "lr_task", "device",
-                "patience", "gradient_accumulation_steps"]:
+                "patience", "gradient_accumulation_steps", "max_spans"]:
         val = getattr(args, key, None)
         if val is not None:
             cfg[key] = val
-    # use_amp は store_true なので None チェック不要
+    # store_true フラグは None チェック不要
     if args.use_amp:
         cfg["use_amp"] = True
+    if args.use_gradient_checkpointing:
+        cfg["use_gradient_checkpointing"] = True
 
     logger.info("Config: %s", json.dumps(cfg, indent=2, ensure_ascii=False))
 
@@ -91,6 +98,7 @@ def main() -> None:
         use_ner=cfg.get("use_ner", True),
         use_rel=cfg.get("use_rel", True),
         use_coref=cfg.get("use_coref", True),
+        max_spans=cfg.get("max_spans", 0),
     )
     dev_ds = DyGIEDataset(
         path=args.dev_path,
@@ -102,6 +110,7 @@ def main() -> None:
         use_ner=cfg.get("use_ner", True),
         use_rel=cfg.get("use_rel", True),
         use_coref=cfg.get("use_coref", True),
+        max_spans=cfg.get("max_spans", 0),
     )
 
     batch_size = cfg.get("batch_size", 4)
@@ -138,6 +147,7 @@ def main() -> None:
         spans_per_word=cfg.get("spans_per_word", 0.4),
         max_top_antecedents=cfg.get("max_top_antecedents", 50),
         dropout=cfg.get("dropout", 0.4),
+        use_gradient_checkpointing=cfg.get("use_gradient_checkpointing", False),
     )
 
     # ---- Trainer ----

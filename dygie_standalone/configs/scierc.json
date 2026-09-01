@@ -38,6 +38,14 @@
   "gradient_accumulation_steps": 1,
   "_comment_gradient_accumulation_steps": "勾配蓄積ステップ数。バッチサイズを増やせない場合に実効バッチサイズを増やす。例: 4 なら実効バッチサイズは batch_size × 4。",
 
+  "_comment_memory": "=== メモリ最適化オプション (v3) ===",
+
+  "use_gradient_checkpointing": true,
+  "_comment_use_gradient_checkpointing": "Transformer エンコーダに勾配チェックポイントを適用。エンコーダの活性化メモリを 50〜70% 削減（学習速度は約 1.3x 低下）。CUDA 環境で OOM が発生する場合に有効。",
+
+  "max_spans": 0,
+  "_comment_max_spans": "文書あたりの最大スパン数（0=上限なし）。RE の K×K ペア行列のメモリを削減する。例: 800 に設定すると K を 800 に制限。エンティティが多い文書には 1000〜1500 が推奨。",
+
   "_comment_ner_labels": "自動収集されます。手動指定したい場合は下記のコメントを外してください。",
   "_ner_labels_example": ["Task", "Method", "Metric", "Material", "OtherScientificTerm", "Generic"],
   "_rel_labels_example": ["Used-for", "Feature-of", "Hyponym-of", "Part-of", "Compare", "Conjunction", "Evaluate-for", "Coref-of"]

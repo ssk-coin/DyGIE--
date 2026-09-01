@@ -65,6 +65,7 @@ class DyGIEDataset(Dataset):
         use_ner: bool = True,
         use_rel: bool = True,
         use_coref: bool = True,
+        max_spans: int = 0,
     ) -> None:
         self.tokenizer = tokenizer
         self.max_span_width = max_span_width
@@ -72,6 +73,7 @@ class DyGIEDataset(Dataset):
         self.use_ner = use_ner
         self.use_rel = use_rel
         self.use_coref = use_coref
+        self.max_spans = max_spans  # 0 = 上限なし
 
         # ---- ラベル辞書（外部指定 or ファイルから自動構築） ----
         self._ner_labels: list[str] = list(ner_labels) if ner_labels else []
@@ -246,6 +248,15 @@ class DyGIEDataset(Dataset):
         if self.use_coref:
             for cluster in doc.get("clusters", []):
                 coref_clusters.append([tuple(mention) for mention in cluster])
+
+        # ---- (6) スパン数の上限設定（メモリ節約）----
+        # max_spans > 0 のとき、先頭 max_spans 件に切り捨てる。
+        # RE の pair 行列は O(K²) のため、K を抑えるとメモリが大幅に削減される。
+        if self.max_spans > 0 and K > self.max_spans:
+            cap = self.max_spans
+            spans_tensor = spans_tensor[:cap]
+            ner_labels_tensor = ner_labels_tensor[:cap]
+            rel_labels_tensor = rel_labels_tensor[:cap, :cap]
 
         return {
             "doc_key": doc_key,

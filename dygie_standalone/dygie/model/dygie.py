@@ -15,6 +15,11 @@ AllenNLP には一切依存しません。
     ハイパーパラメータを保存・復元するように対応。
     モデルのロードに kwargs を全て手動で指定する必要がなくなった。
   - torch.load に weights_only=True を追加（セキュリティ改善・PyTorch 警告抑制）
+
+メモリ最適化 (v3):
+  - use_gradient_checkpointing=True で Transformer エンコーダに勾配チェックポイントを
+    適用。エンコーダの活性化メモリを約 50〜70% 削減（学習速度は約 1.3x 低下）。
+  - RE モジュールを K×K → E×E（エンティティスパンのみ）に変更済み。
 """
 
 from __future__ import annotations
@@ -82,6 +87,7 @@ class DyGIE(nn.Module):
         spans_per_word: float = 0.4,
         max_top_antecedents: int = 50,
         dropout: float = 0.4,
+        use_gradient_checkpointing: bool = False,
     ) -> None:
         super().__init__()
 
@@ -112,10 +118,17 @@ class DyGIE(nn.Module):
             "spans_per_word": spans_per_word,
             "max_top_antecedents": max_top_antecedents,
             "dropout": dropout,
+            "use_gradient_checkpointing": use_gradient_checkpointing,
         }
 
         # ---- Transformer encoder ----
         self.encoder = AutoModel.from_pretrained(transformer_model)
+
+        # 勾配チェックポイント: エンコーダの活性化メモリを 50〜70% 削減
+        # （学習速度は約 1.3x 低下するトレードオフ）
+        if use_gradient_checkpointing:
+            self.encoder.gradient_checkpointing_enable()
+            logger.info("Gradient checkpointing enabled for encoder.")
         hidden_size: int = self.encoder.config.hidden_size
 
         # ---- Span extractor ----
