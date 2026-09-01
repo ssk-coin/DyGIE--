@@ -1,5 +1,5 @@
 """
-DyGIE++ Standalone — Span Extractor
+DyGIE-- Standalone — Span Extractor
 
 DyGIE++ 原論文と同様に、スパン表現を次の 3 要素の連結で構成します:
   1. span start の subword 表現
