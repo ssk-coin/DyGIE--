@@ -26,6 +26,14 @@ RE スコア改善 (v4):
   - スパン間距離特徴（use_distance_feature / distance_embedding_dim で制御）
   - Focal Loss による RE クラス不均衡への対処（focal_loss_gamma で制御）
   - Pair MLP を 2 層 + LayerNorm に深化
+
+グラフ構造統合 (v5):
+  - DyGIE++ 論文 (Wadden et al., 2019) Section 3.3 のスパングラフ伝播を実装。
+  - フォワードパスの実行順序を論文に従って変更:
+      span_repr → Coref → SpanPropagation → NER → RE
+  - Coref クラスタを辺とするスパングラフを構築し、GRU スタイルのゲーティングで
+    スパン表現を更新してから NER・RE を計算する。
+    同一エンティティの複数スパン間で情報共有できるため、NER・RE 精度が向上する。
 """
 
 from __future__ import annotations
@@ -43,6 +51,7 @@ from .span_extractor import SpanExtractor
 from .ner_module import NERModule
 from .rel_module import RelationModule
 from .coref_module import CorefModule
+from .span_propagation import SpanPropagation
 
 logger = logging.getLogger(__name__)
 
@@ -203,8 +212,12 @@ class DyGIE(nn.Module):
                 max_top_antecedents=max_top_antecedents,
                 dropout=dropout,
             )
+            # スパングラフ伝播: Coref クラスタを辺として NER/RE 前に span_repr を更新
+            # (DyGIE++ 論文 Section 3.3 / Wadden et al., 2019)
+            self.span_prop = SpanPropagation(span_dim=span_dim, dropout=dropout)
         else:
             self.coref_module = None  # type: ignore
+            self.span_prop = None  # type: ignore
 
         logger.info(
             "DyGIE initialized | encoder=%s | NER=%s | RE=%s | Coref=%s | span_dim=%d",
@@ -266,7 +279,34 @@ class DyGIE(nn.Module):
         output: dict[str, Any] = {}
         total_loss = torch.tensor(0.0, device=input_ids.device)
 
-        # ---- NER ----
+        # ---- Coreference (論文に従い NER/RE より先に実行) ----
+        # DyGIE++ (Wadden et al., 2019) の実行順序:
+        #   span_repr → Coref → SpanPropagation → NER → RE
+        if self.coref_module is not None:
+            coref_out = self.coref_module(
+                span_repr=span_repr,
+                span_mask=span_mask,
+                spans=spans,
+                num_tokens=num_tokens,
+                coref_clusters=coref_clusters,
+            )
+            output.update(coref_out)
+            if "coref_loss" in coref_out:
+                total_loss = total_loss + self.coref_loss_weight * coref_out["coref_loss"]
+
+            # ---- Span Graph Propagation (Section 3.3) ----
+            # Coref クラスタを辺として span_repr を GRU スタイルで更新する。
+            # 更新後の span_repr を NER・RE で使用することで、
+            # 同一エンティティの複数スパン間で情報共有が可能になる。
+            if self.span_prop is not None:
+                span_repr = self.span_prop(
+                    span_repr=span_repr,
+                    top_span_indices=coref_out["top_span_indices"],
+                    top_span_mask=coref_out["top_span_mask"],
+                    antecedent_scores=coref_out["antecedent_scores"],
+                )
+
+        # ---- NER (伝播後の span_repr を使用) ----
         if self.ner_module is not None:
             ner_out = self.ner_module(
                 span_repr=span_repr,
@@ -281,7 +321,7 @@ class DyGIE(nn.Module):
                 span_repr.shape[:2], dtype=torch.long, device=input_ids.device
             )
 
-        # ---- Relation Extraction ----
+        # ---- Relation Extraction (伝播後の span_repr を使用) ----
         if self.rel_module is not None:
             rel_out = self.rel_module(
                 span_repr=span_repr,
@@ -295,19 +335,6 @@ class DyGIE(nn.Module):
             output.update(rel_out)
             if "rel_loss" in rel_out:
                 total_loss = total_loss + self.rel_loss_weight * rel_out["rel_loss"]
-
-        # ---- Coreference ----
-        if self.coref_module is not None:
-            coref_out = self.coref_module(
-                span_repr=span_repr,
-                span_mask=span_mask,
-                spans=spans,
-                num_tokens=num_tokens,
-                coref_clusters=coref_clusters,
-            )
-            output.update(coref_out)
-            if "coref_loss" in coref_out:
-                total_loss = total_loss + self.coref_loss_weight * coref_out["coref_loss"]
 
         if ner_labels is not None or rel_labels is not None or coref_clusters is not None:
             output["loss"] = total_loss
