@@ -52,6 +52,7 @@ from .ner_module import NERModule
 from .rel_module import RelationModule
 from .coref_module import CorefModule
 from .span_propagation import SpanPropagation
+from .event_module import EventModule
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +93,14 @@ class DyGIE(nn.Module):
         距離埋め込みの次元 (0 で無効)。
     focal_loss_gamma : float
         RE Focal Loss の gamma 値 (0 で通常の CE)。
+    use_event : bool
+        イベント抽出を有効にするか。
+    event_type_labels : list[str]
+        イベントタイプラベル一覧（"no trigger" を除く）。
+    arg_role_labels : list[str]
+        引数ロールラベル一覧（"no role" を除く）。
+    event_loss_weight : float
+        イベント抽出損失の重み（trigger_loss + arg_loss の合計に掛ける）。
     """
 
     def __init__(
@@ -118,17 +127,26 @@ class DyGIE(nn.Module):
         num_distance_buckets: int = 10,
         distance_embedding_dim: int = 64,
         focal_loss_gamma: float = 0.0,
+        # イベント抽出 (v5)
+        use_event: bool = False,
+        event_type_labels: list[str] | None = None,
+        arg_role_labels: list[str] | None = None,
+        event_loss_weight: float = 1.0,
     ) -> None:
         super().__init__()
 
         self.use_ner = use_ner
         self.use_rel = use_rel
         self.use_coref = use_coref
+        self.use_event = use_event
         self.ner_loss_weight = ner_loss_weight
         self.rel_loss_weight = rel_loss_weight
         self.coref_loss_weight = coref_loss_weight
+        self.event_loss_weight = event_loss_weight
         self.ner_labels = ner_labels
         self.rel_labels = rel_labels
+        self.event_type_labels = list(event_type_labels) if event_type_labels else []
+        self.arg_role_labels = list(arg_role_labels) if arg_role_labels else []
 
         # save_pretrained / from_pretrained 用に初期化パラメータを記録
         self._init_config: dict[str, Any] = {
@@ -155,6 +173,11 @@ class DyGIE(nn.Module):
             "num_distance_buckets": num_distance_buckets,
             "distance_embedding_dim": distance_embedding_dim,
             "focal_loss_gamma": focal_loss_gamma,
+            # v5: イベント抽出
+            "use_event": use_event,
+            "event_type_labels": self.event_type_labels,
+            "arg_role_labels": self.arg_role_labels,
+            "event_loss_weight": event_loss_weight,
         }
 
         # ---- Transformer encoder ----
@@ -219,12 +242,25 @@ class DyGIE(nn.Module):
             self.coref_module = None  # type: ignore
             self.span_prop = None  # type: ignore
 
+        # ---- イベント抽出ヘッド ----
+        if use_event and event_type_labels:
+            self.event_module = EventModule(
+                span_dim=span_dim,
+                num_event_types=len(self.event_type_labels),
+                num_arg_roles=len(self.arg_role_labels),
+                feedforward_dim=feedforward_dim,
+                dropout=dropout,
+            )
+        else:
+            self.event_module = None  # type: ignore
+
         logger.info(
-            "DyGIE initialized | encoder=%s | NER=%s | RE=%s | Coref=%s | span_dim=%d",
+            "DyGIE initialized | encoder=%s | NER=%s | RE=%s | Coref=%s | Event=%s | span_dim=%d",
             transformer_model,
             use_ner,
             use_rel,
             use_coref,
+            use_event,
             span_dim,
         )
 
@@ -240,9 +276,11 @@ class DyGIE(nn.Module):
         spans: torch.Tensor,               # [B, K, 2]
         span_mask: torch.Tensor,           # [B, K]
         num_tokens: torch.Tensor,          # [B]
-        ner_labels: torch.Tensor | None = None,       # [B, K]
-        rel_labels: torch.Tensor | None = None,       # [B, K, K]
+        ner_labels: torch.Tensor | None = None,                 # [B, K]
+        rel_labels: torch.Tensor | None = None,                 # [B, K, K]
         coref_clusters: list | None = None,
+        event_trigger_labels: torch.Tensor | None = None,       # [B, K]
+        event_arg_labels: torch.Tensor | None = None,           # [B, K, K]
         use_gold_spans: bool = True,
     ) -> dict[str, Any]:
         """
@@ -336,7 +374,29 @@ class DyGIE(nn.Module):
             if "rel_loss" in rel_out:
                 total_loss = total_loss + self.rel_loss_weight * rel_out["rel_loss"]
 
-        if ner_labels is not None or rel_labels is not None or coref_clusters is not None:
+        # ---- Event Extraction ----
+        # 実行順序: Coref → SpanProp → NER → RE → Event
+        # イベントトリガー検出と引数抽出は伝播後の span_repr を使用する。
+        if self.event_module is not None:
+            event_out = self.event_module(
+                span_repr=span_repr,
+                span_mask=span_mask,
+                event_trigger_labels=event_trigger_labels,
+                event_arg_labels=event_arg_labels,
+                use_gold_triggers=use_gold_spans,
+            )
+            # キー名に "event_" プレフィックスを付けて output に統合
+            for k, v in event_out.items():
+                output[f"event_{k}" if not k.startswith("event_") else k] = v
+            if "event_loss" in event_out:
+                total_loss = total_loss + self.event_loss_weight * event_out["event_loss"]
+
+        if (
+            ner_labels is not None
+            or rel_labels is not None
+            or coref_clusters is not None
+            or event_trigger_labels is not None
+        ):
             output["loss"] = total_loss
 
         return output

@@ -25,9 +25,10 @@ from transformers import BertConfig, BertModel, BertTokenizerFast, PreTrainedTok
 
 from dygie.data import DyGIEDataset, collate_fn
 from dygie.model import DyGIE
-from dygie.training.metrics import NERMetrics, RelationMetrics, CorefMetrics
+from dygie.training.metrics import NERMetrics, RelationMetrics, CorefMetrics, EventMetrics
 
 SAMPLE = Path(__file__).parent.parent / "data" / "sample" / "sample.jsonl"
+SAMPLE_EVENT = Path(__file__).parent.parent / "data" / "sample" / "sample_event.jsonl"
 
 # ---- ダミー BERT をローカルに生成（外部通信不要） ----
 _DUMMY_DIR = Path(tempfile.mkdtemp(prefix="dygie_test_bert_"))
@@ -453,6 +454,204 @@ def test_coref_distance_embedding():
           "causal masking verified")
 
 
+def test_event_metrics():
+    """EventMetrics が trigger / argument の F1 を正しく計算することを確認する。"""
+    metrics = EventMetrics()
+
+    B, K = 1, 4
+    # trigger_preds[b, k]: pred label (0=none, 1=type_A)
+    # gold: span 0 is type_A, span 2 is type_A; pred: span 0 correct, span 2 missed, span 3 false positive
+    trigger_preds = torch.tensor([[1, 0, 0, 1]])  # TP=1, FP=1, FN=1
+    trigger_golds = torch.tensor([[1, 0, 1, 0]])
+    span_mask     = torch.tensor([[True, True, True, True]])
+
+    # arg: span 0 is trigger (gold), arg at span 1 with role 1
+    # pred: (0,1)=1 correct; (3,1)=1 false positive (trigger 3 is not in gold)
+    arg_preds = torch.zeros(B, K, K, dtype=torch.long)
+    arg_golds = torch.zeros(B, K, K, dtype=torch.long)
+    arg_mask  = torch.zeros(B, K, K, dtype=torch.bool)
+
+    arg_golds[0, 0, 1] = 1    # gold: trigger=0 → arg=1 with role 1
+    arg_preds[0, 0, 1] = 1    # pred: TP
+    arg_preds[0, 3, 1] = 1    # pred: FP (trigger 3 is not in gold)
+    arg_mask[0, 0, 1]  = True
+    arg_mask[0, 3, 1]  = True  # trigger 3 predicted (but not gold)
+
+    metrics.update(trigger_preds, trigger_golds, arg_preds, arg_golds, span_mask, arg_mask)
+    r = metrics.compute()
+
+    assert "event_trigger_f1" in r
+    assert "event_arg_f1" in r
+    assert 0 <= r["event_trigger_f1"] <= 1
+    assert 0 <= r["event_arg_f1"] <= 1
+    # trigger: tp=1, fp=1, fn=1 → P=R=F1=0.5
+    assert abs(r["event_trigger_f1"] - 0.5) < 1e-3, \
+        f"Trigger F1 expected 0.5, got {r['event_trigger_f1']:.4f}"
+    print(f"  [OK] EventMetrics: trigger_F1={r['event_trigger_f1']:.4f}, "
+          f"arg_F1={r['event_arg_f1']:.4f}")
+
+
+def test_event_forward():
+    """イベント抽出モデルの forward pass と損失が正常に動作することを確認する。"""
+    import json
+    import tempfile
+
+    # ---- 合成イベントデータを一時ファイルに作成 ----
+    # ドキュメント全体でフラットなトークンインデックスを使用
+    # doc: sentences[0] = ["John", "died", "in", "Paris", "."] (tokens 0-4)
+    #       sentences[1] = ["Mary", "was", "born", "in", "London", "."] (tokens 5-10)
+    # events: sentence 0: trigger "died" (token 1) → Life:Die; arg "John" (0) = Person
+    #         sentence 1: trigger "born" (token 7) → Life:Be-Born; arg "Mary" (5) = Person
+    event_docs = [
+        {
+            "doc_key": "evt_001",
+            "dataset": "ace05",
+            "sentences": [
+                ["John", "died", "in", "Paris", "."],
+                ["Mary", "was", "born", "in", "London", "."],
+            ],
+            "ner": [[[0, 0, "PER"], [3, 3, "GPE"]], [[5, 5, "PER"], [9, 9, "GPE"]]],
+            "relations": [[], []],
+            "events": [
+                # sentence 0 events: flat token indices
+                [[[1, 1, "Life:Die"], [0, 0, "Person"]]],
+                # sentence 1 events
+                [[[7, 7, "Life:Be-Born"], [5, 5, "Person"]]],
+            ],
+        },
+        {
+            "doc_key": "evt_002",
+            "dataset": "ace05",
+            "sentences": [
+                ["The", "company", "merged", "yesterday", "."],
+            ],
+            "ner": [[[1, 1, "ORG"]]],
+            "relations": [[]],
+            "events": [
+                [[[2, 2, "Business:Merge-Org"], [1, 1, "Org"]]],
+            ],
+        },
+        {
+            "doc_key": "evt_003",
+            "dataset": "ace05",
+            "sentences": [
+                ["He", "won", "the", "election", "."],
+            ],
+            "ner": [[[0, 0, "PER"]]],
+            "relations": [[]],
+            "events": [
+                [[[1, 1, "Personnel:Elect"], [0, 0, "Person"]]],
+            ],
+        },
+    ]
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as tf:
+        for doc in event_docs:
+            tf.write(json.dumps(doc) + "\n")
+        event_path = tf.name
+
+    try:
+        tok = _TOK
+        ds = DyGIEDataset(
+            event_path, tok,
+            max_span_width=4, max_total_length=128,
+            use_ner=True, use_rel=False, use_coref=False, use_event=True,
+        )
+
+        assert len(ds.event_type_labels) > 0, "No event type labels collected"
+        assert len(ds.arg_role_labels) > 0, "No arg role labels collected"
+
+        loader = DataLoader(ds, batch_size=2, collate_fn=collate_fn)
+        batch = next(iter(loader))
+
+        # 合成データにイベントラベルが含まれることを確認
+        assert "event_trigger_labels" in batch, "event_trigger_labels missing from batch"
+        assert "event_arg_labels" in batch, "event_arg_labels missing from batch"
+        # 少なくとも1つのトリガーが存在するはず
+        assert batch["event_trigger_labels"].max().item() > 0, \
+            "No positive trigger labels found in batch"
+
+        # モデル構築
+        model = DyGIE(
+            transformer_model=MODEL_NAME,
+            ner_labels=ds.ner_labels,
+            rel_labels=ds.rel_labels,
+            max_span_width=4,
+            use_ner=True,
+            use_rel=False,
+            use_coref=False,
+            use_event=True,
+            event_type_labels=ds.event_type_labels,
+            arg_role_labels=ds.arg_role_labels,
+            feedforward_dim=64,
+            width_embedding_dim=32,
+            dropout=0.0,
+        )
+        model.eval()
+
+        with torch.no_grad():
+            out = model(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                token_to_subword=batch["token_to_subword"],
+                spans=batch["spans"],
+                span_mask=batch["span_mask"],
+                num_tokens=batch["num_tokens"],
+                ner_labels=batch["ner_labels"],
+                event_trigger_labels=batch["event_trigger_labels"],
+                event_arg_labels=batch["event_arg_labels"],
+                use_gold_spans=True,
+            )
+
+        assert "loss" in out, "loss missing from event model output"
+        assert not out["loss"].isnan().item(), "event model loss is NaN"
+        assert "event_trigger_preds" in out, "event_trigger_preds missing"
+        assert "event_arg_preds" in out, "event_arg_preds missing"
+        assert "event_arg_mask" in out, "event_arg_mask missing"
+        assert "event_loss" in out, "event_loss missing"
+
+        # 推論モード（ラベルなし）
+        with torch.no_grad():
+            out_inf = model(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                token_to_subword=batch["token_to_subword"],
+                spans=batch["spans"],
+                span_mask=batch["span_mask"],
+                num_tokens=batch["num_tokens"],
+                use_gold_spans=False,
+            )
+        assert "loss" not in out_inf, "loss should not appear in inference mode"
+        assert "event_trigger_preds" in out_inf
+        assert "event_arg_preds" in out_inf
+
+        # backward パス
+        model.train()
+        out_train = model(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            token_to_subword=batch["token_to_subword"],
+            spans=batch["spans"],
+            span_mask=batch["span_mask"],
+            num_tokens=batch["num_tokens"],
+            ner_labels=batch["ner_labels"],
+            event_trigger_labels=batch["event_trigger_labels"],
+            event_arg_labels=batch["event_arg_labels"],
+            use_gold_spans=True,
+        )
+        out_train["loss"].backward()
+
+        print(
+            f"  [OK] Event Forward: loss={out['loss'].item():.4f} | "
+            f"event_loss={out['event_loss'].item():.4f} | "
+            f"trigger_labels={ds.event_type_labels} | "
+            f"arg_roles={ds.arg_role_labels}"
+        )
+    finally:
+        import os
+        os.unlink(event_path)
+
+
 if __name__ == "__main__":
     tests = [
         ("Dataset",                           test_dataset),
@@ -465,6 +664,8 @@ if __name__ == "__main__":
         ("Backward pass",                     test_backward),
         ("RE v4 features",                    test_re_v4_features),
         ("Coref distance embedding",          test_coref_distance_embedding),
+        ("Event Metrics",                     test_event_metrics),
+        ("Event Forward + Loss",              test_event_forward),
     ]
     print("\n===== DyGIE++ Standalone Smoke Tests =====")
     passed = failed = 0

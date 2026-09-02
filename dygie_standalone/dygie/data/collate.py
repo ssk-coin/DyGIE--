@@ -61,6 +61,8 @@ def collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
     span_mask = torch.zeros(B, max_spans, dtype=torch.bool)
     ner_labels = torch.zeros(B, max_spans, dtype=torch.long)
     rel_labels = torch.zeros(B, max_spans, max_spans, dtype=torch.long)
+    event_trigger_labels = torch.zeros(B, max_spans, dtype=torch.long)
+    event_arg_labels = torch.zeros(B, max_spans, max_spans, dtype=torch.long)
 
     for i, s in enumerate(batch):
         K = s["spans"].size(0)
@@ -68,6 +70,8 @@ def collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
         span_mask[i, :K] = True
         ner_labels[i, :K] = s["ner_labels"]
         rel_labels[i, :K, :K] = s["rel_labels"]
+        event_trigger_labels[i, :K] = s["event_trigger_labels"]
+        event_arg_labels[i, :K, :K] = s["event_arg_labels"]
 
     sentence_offsets = [s["sentence_offsets"] for s in batch]
     coref_clusters = [s["coref_clusters"] for s in batch]
@@ -84,5 +88,7 @@ def collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "ner_labels": ner_labels,
         "rel_labels": rel_labels,
         "coref_clusters": coref_clusters,
+        "event_trigger_labels": event_trigger_labels,
+        "event_arg_labels": event_arg_labels,
         "num_tokens": num_tokens,
     }

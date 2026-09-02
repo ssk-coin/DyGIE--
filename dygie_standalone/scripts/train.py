@@ -75,6 +75,11 @@ def parse_args() -> argparse.Namespace:
                    help="距離埋め込みの次元数（0=無効）")
     p.add_argument("--focal_loss_gamma",  type=float, default=None,
                    help="RE Focal Loss の gamma 値（0=通常の CE、2.0 が推奨）")
+    # イベント抽出オプション
+    p.add_argument("--use_event",         action="store_true", default=None,
+                   help="イベント抽出タスクを有効化")
+    p.add_argument("--event_loss_weight", type=float, default=None,
+                   help="イベント抽出損失の重み（デフォルト 1.0）")
     return p.parse_args()
 
 
@@ -100,6 +105,10 @@ def main() -> None:
         cfg["use_gradient_checkpointing"] = True
     if args.use_distance_feature:
         cfg["use_distance_feature"] = True
+    if args.use_event:
+        cfg["use_event"] = True
+    if args.event_loss_weight is not None:
+        cfg["event_loss_weight"] = args.event_loss_weight
 
     logger.info("Config: %s", json.dumps(cfg, indent=2, ensure_ascii=False))
 
@@ -107,6 +116,7 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(cfg["transformer_model"])
 
     # ---- Dataset ----
+    use_event = cfg.get("use_event", False)
     train_ds = DyGIEDataset(
         path=args.train_path,
         tokenizer=tokenizer,
@@ -115,6 +125,7 @@ def main() -> None:
         use_ner=cfg.get("use_ner", True),
         use_rel=cfg.get("use_rel", True),
         use_coref=cfg.get("use_coref", True),
+        use_event=use_event,
         max_spans=cfg.get("max_spans", 0),
     )
     dev_ds = DyGIEDataset(
@@ -124,9 +135,12 @@ def main() -> None:
         max_total_length=cfg.get("max_total_length", 512),
         ner_labels=train_ds.ner_labels,
         rel_labels=train_ds.rel_labels,
+        event_type_labels=train_ds.event_type_labels if use_event else None,
+        arg_role_labels=train_ds.arg_role_labels if use_event else None,
         use_ner=cfg.get("use_ner", True),
         use_rel=cfg.get("use_rel", True),
         use_coref=cfg.get("use_coref", True),
+        use_event=use_event,
         max_spans=cfg.get("max_spans", 0),
     )
 
@@ -171,6 +185,11 @@ def main() -> None:
         num_distance_buckets=cfg.get("num_distance_buckets", 10),
         distance_embedding_dim=cfg.get("distance_embedding_dim", 64),
         focal_loss_gamma=cfg.get("focal_loss_gamma", 0.0),
+        # v5: イベント抽出
+        use_event=use_event,
+        event_type_labels=train_ds.event_type_labels if use_event else None,
+        arg_role_labels=train_ds.arg_role_labels if use_event else None,
+        event_loss_weight=cfg.get("event_loss_weight", 1.0),
     )
 
     # ---- Trainer ----
@@ -196,11 +215,15 @@ def main() -> None:
     # ラベル情報と設定を保存
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
+    label_info = {
+        "ner_labels": train_ds.ner_labels,
+        "rel_labels": train_ds.rel_labels,
+    }
+    if use_event:
+        label_info["event_type_labels"] = train_ds.event_type_labels
+        label_info["arg_role_labels"] = train_ds.arg_role_labels
     with open(out / "labels.json", "w") as f:
-        json.dump(
-            {"ner_labels": train_ds.ner_labels, "rel_labels": train_ds.rel_labels},
-            f, indent=2,
-        )
+        json.dump(label_info, f, indent=2)
     with open(out / "config.json", "w") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
 

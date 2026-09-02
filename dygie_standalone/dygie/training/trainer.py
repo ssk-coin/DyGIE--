@@ -33,7 +33,7 @@ from torch.utils.data import DataLoader
 from transformers import get_linear_schedule_with_warmup
 
 from ..model.dygie import DyGIE
-from .metrics import NERMetrics, RelationMetrics, CorefMetrics
+from .metrics import NERMetrics, RelationMetrics, CorefMetrics, EventMetrics
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +149,7 @@ class Trainer:
         self.ner_metrics = NERMetrics()
         self.rel_metrics = RelationMetrics()
         self.coref_metrics = CorefMetrics()
+        self.event_metrics = EventMetrics()
 
         self.best_dev_score = -1.0
         self._patience_counter = 0
@@ -247,6 +248,10 @@ class Trainer:
                     ner_labels=batch.get("ner_labels"),
                     rel_labels=batch.get("rel_labels"),
                     coref_clusters=batch.get("coref_clusters"),
+                    event_trigger_labels=batch.get("event_trigger_labels")
+                        if self.model.use_event else None,
+                    event_arg_labels=batch.get("event_arg_labels")
+                        if self.model.use_event else None,
                     use_gold_spans=self.use_gold_spans_for_rel,
                 )
 
@@ -294,6 +299,7 @@ class Trainer:
         self.ner_metrics.reset()
         self.rel_metrics.reset()
         self.coref_metrics.reset()
+        self.event_metrics.reset()
 
         for batch in loader:
             batch = self._to_device(batch)
@@ -304,7 +310,7 @@ class Trainer:
                 spans=batch["spans"],
                 span_mask=batch["span_mask"],
                 num_tokens=batch["num_tokens"],
-                use_gold_spans=False,  # 推論時は predicted NER を使用
+                use_gold_spans=False,  # 推論時は predicted NER / trigger を使用
             )
 
             if self.model.use_ner and "ner_preds" in outputs:
@@ -334,6 +340,16 @@ class Trainer:
                         gold_clusters=batch["coref_clusters"][b],
                     )
 
+            if self.model.use_event and "event_trigger_preds" in outputs:
+                self.event_metrics.update(
+                    trigger_preds=outputs["event_trigger_preds"].cpu(),
+                    trigger_golds=batch["event_trigger_labels"].cpu(),
+                    arg_preds=outputs["event_arg_preds"].cpu(),
+                    arg_golds=batch["event_arg_labels"].cpu(),
+                    span_mask=batch["span_mask"].cpu(),
+                    arg_mask=outputs["event_arg_mask"].cpu(),
+                )
+
         metrics: dict[str, float] = {}
         if self.model.use_ner:
             metrics.update(self.ner_metrics.compute())
@@ -341,6 +357,8 @@ class Trainer:
             metrics.update(self.rel_metrics.compute())
         if self.model.use_coref:
             metrics.update(self.coref_metrics.compute())
+        if self.model.use_event:
+            metrics.update(self.event_metrics.compute())
 
         return metrics
 
