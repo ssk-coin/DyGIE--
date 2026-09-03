@@ -188,10 +188,11 @@ class Trainer:
                 # ウォームアップ期間中は patience カウンタを増加させない
                 if epoch > self.early_stopping_warmup:
                     self._patience_counter += 1
+                    patience_limit = str(self.patience) if self.patience > 0 else "∞"
                     logger.info(
-                        "  No improvement. Patience: %d/%d",
+                        "  No improvement. Patience: %d/%s",
                         self._patience_counter,
-                        self.patience if self.patience > 0 else float("inf"),
+                        patience_limit,
                     )
                 else:
                     logger.info(
