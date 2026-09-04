@@ -80,6 +80,15 @@ def parse_args() -> argparse.Namespace:
                    help="イベント抽出タスクを有効化")
     p.add_argument("--event_loss_weight", type=float, default=None,
                    help="イベント抽出損失の重み（デフォルト 1.0）")
+    # LoRA オプション (v6)
+    p.add_argument("--use_lora",          action="store_true", default=None,
+                   help="LoRA (Low-Rank Adaptation) を有効化（pip install peft 必要）")
+    p.add_argument("--lora_r",            type=int,   default=None,
+                   help="LoRA のランク（デフォルト 8）")
+    p.add_argument("--lora_alpha",        type=int,   default=None,
+                   help="LoRA のスケーリング係数（デフォルト 32）")
+    p.add_argument("--lora_dropout",      type=float, default=None,
+                   help="LoRA アダプタ内の Dropout 率（デフォルト 0.1）")
     return p.parse_args()
 
 
@@ -109,6 +118,13 @@ def main() -> None:
         cfg["use_event"] = True
     if args.event_loss_weight is not None:
         cfg["event_loss_weight"] = args.event_loss_weight
+    # LoRA (store_true / int / float)
+    if args.use_lora:
+        cfg["use_lora"] = True
+    for key in ["lora_r", "lora_alpha", "lora_dropout"]:
+        val = getattr(args, key, None)
+        if val is not None:
+            cfg[key] = val
 
     logger.info("Config: %s", json.dumps(cfg, indent=2, ensure_ascii=False))
 
@@ -190,6 +206,12 @@ def main() -> None:
         event_type_labels=train_ds.event_type_labels if use_event else None,
         arg_role_labels=train_ds.arg_role_labels if use_event else None,
         event_loss_weight=cfg.get("event_loss_weight", 1.0),
+        # v6: LoRA
+        use_lora=cfg.get("use_lora", False),
+        lora_r=cfg.get("lora_r", 8),
+        lora_alpha=cfg.get("lora_alpha", 32),
+        lora_dropout=cfg.get("lora_dropout", 0.1),
+        lora_target_modules=cfg.get("lora_target_modules", None),
     )
 
     # ---- Trainer ----

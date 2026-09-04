@@ -121,10 +121,17 @@ class Trainer:
         if self.use_amp:
             logger.info("AMP (automatic mixed precision) enabled.")
 
-        # optimizer: Transformer と task head を分離
-        encoder_params = list(model.encoder.parameters())
+        # optimizer: Transformer（または LoRA アダプタ）と task head を分離
+        # LoRA 有効時: encoder の凍結パラメータ (requires_grad=False) を除外し、
+        #              LoRA の A/B 行列のみ lr_transformer で更新する。
+        encoder_params = [
+            p for p in model.encoder.parameters() if p.requires_grad
+        ]
         encoder_ids = {id(p) for p in encoder_params}
-        task_params = [p for p in model.parameters() if id(p) not in encoder_ids]
+        task_params = [
+            p for p in model.parameters()
+            if id(p) not in encoder_ids and p.requires_grad
+        ]
 
         self.optimizer = torch.optim.AdamW(
             [

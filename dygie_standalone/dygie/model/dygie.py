@@ -101,6 +101,20 @@ class DyGIE(nn.Module):
         引数ロールラベル一覧（"no role" を除く）。
     event_loss_weight : float
         イベント抽出損失の重み（trigger_loss + arg_loss の合計に掛ける）。
+    use_lora : bool
+        LoRA (Low-Rank Adaptation) を有効にするか。
+        True にすると BERT エンコーダの大半を凍結し、LoRA アダプタ重みのみ学習する。
+        小規模データでの過学習抑制・GPU メモリ削減に有効。
+        peft ライブラリが必要: pip install peft
+    lora_r : int
+        LoRA のランク。低いほどパラメータが少ない（推奨: 4〜16）。
+    lora_alpha : int
+        LoRA のスケーリング係数。通常 lora_r の 2〜4 倍に設定する。
+    lora_dropout : float
+        LoRA アダプタ内の Dropout 率。
+    lora_target_modules : list[str] | None
+        LoRA を適用する BERT のモジュール名。
+        None のとき BERT/SciBERT デフォルト ["query", "value"] を使用。
     """
 
     def __init__(
@@ -132,6 +146,12 @@ class DyGIE(nn.Module):
         event_type_labels: list[str] | None = None,
         arg_role_labels: list[str] | None = None,
         event_loss_weight: float = 1.0,
+        # LoRA アダプタ (v6)
+        use_lora: bool = False,
+        lora_r: int = 8,
+        lora_alpha: int = 32,
+        lora_dropout: float = 0.1,
+        lora_target_modules: list[str] | None = None,
     ) -> None:
         super().__init__()
 
@@ -178,10 +198,46 @@ class DyGIE(nn.Module):
             "event_type_labels": self.event_type_labels,
             "arg_role_labels": self.arg_role_labels,
             "event_loss_weight": event_loss_weight,
+            # v6: LoRA
+            "use_lora": use_lora,
+            "lora_r": lora_r,
+            "lora_alpha": lora_alpha,
+            "lora_dropout": lora_dropout,
+            "lora_target_modules": lora_target_modules or ["query", "value"],
         }
 
         # ---- Transformer encoder ----
         self.encoder = AutoModel.from_pretrained(transformer_model)
+
+        # ---- LoRA アダプタ (v6) ----
+        # BERT エンコーダの大半を凍結し、低ランク行列のみ学習する。
+        # 小規模データ (SciERC, ACE05 等) での過学習抑制・メモリ削減に有効。
+        self.use_lora = use_lora
+        if use_lora:
+            try:
+                from peft import get_peft_model, LoraConfig
+            except ImportError as e:
+                raise ImportError(
+                    "LoRA を使用するには peft ライブラリが必要です: pip install peft"
+                ) from e
+            _target_modules = lora_target_modules or ["query", "value"]
+            lora_cfg = LoraConfig(
+                r=lora_r,
+                lora_alpha=lora_alpha,
+                target_modules=_target_modules,
+                lora_dropout=lora_dropout,
+                bias="none",
+            )
+            self.encoder = get_peft_model(self.encoder, lora_cfg)
+            # 勾配チェックポイントと LoRA を併用する場合は入力勾配を有効化
+            self.encoder.enable_input_require_grads()
+            trainable, total = self._count_lora_params()
+            logger.info(
+                "LoRA enabled | r=%d, alpha=%d, target=%s | "
+                "trainable params: %d / %d (%.2f%%)",
+                lora_r, lora_alpha, _target_modules,
+                trainable, total, 100 * trainable / max(total, 1),
+            )
 
         # 勾配チェックポイント: エンコーダの活性化メモリを 50〜70% 削減
         # （学習速度は約 1.3x 低下するトレードオフ）
@@ -255,13 +311,28 @@ class DyGIE(nn.Module):
             self.event_module = None  # type: ignore
 
         logger.info(
-            "DyGIE initialized | encoder=%s | NER=%s | RE=%s | Coref=%s | Event=%s | span_dim=%d",
+            "DyGIE initialized | encoder=%s | NER=%s | RE=%s | Coref=%s | Event=%s"
+            " | LoRA=%s | span_dim=%d",
             transformer_model,
-            use_ner,
-            use_rel,
-            use_coref,
-            use_event,
-            span_dim,
+            use_ner, use_rel, use_coref, use_event, use_lora, span_dim,
+        )
+
+    # ------------------------------------------------------------------
+    # LoRA ユーティリティ
+    # ------------------------------------------------------------------
+
+    def _count_lora_params(self) -> tuple[int, int]:
+        """学習可能パラメータ数と総パラメータ数を返す。"""
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        total     = sum(p.numel() for p in self.parameters())
+        return trainable, total
+
+    def print_trainable_parameters(self) -> None:
+        """学習可能パラメータ数を表示する（診断用）。"""
+        trainable, total = self._count_lora_params()
+        print(
+            f"Trainable params: {trainable:,} / {total:,} "
+            f"({100 * trainable / max(total, 1):.2f}%)"
         )
 
     # ------------------------------------------------------------------
@@ -431,16 +502,21 @@ class DyGIE(nn.Module):
         """モデル全体を output_dir に保存する。
 
         保存ファイル:
-          model.pt          — PyTorch state dict
+          model.pt          — PyTorch state dict（LoRA 重みを含む）
           config.json       — Transformer encoder config
-          dygie_config.json — DyGIE 固有のハイパーパラメータ
+          dygie_config.json — DyGIE 固有のハイパーパラメータ（LoRA 設定を含む）
+
+        LoRA 有効時:
+          state dict には LoRA の A/B 行列と凍結 BERT 重みの両方が保存される。
+          from_pretrained() 時に use_lora=True で自動的に LoRA 構造を再構築し、
+          state dict を読み込む。
         """
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         torch.save(self.state_dict(), output_dir / "model.pt")
-        # encoder の config も保存
+        # encoder の config を保存（peft モデルは base_model.config にプロキシされる）
         self.encoder.config.save_pretrained(output_dir)
-        # DyGIE 固有の設定を保存
+        # DyGIE 固有の設定（LoRA 設定を含む）を保存
         with open(output_dir / "dygie_config.json", "w", encoding="utf-8") as f:
             json.dump(self._init_config, f, indent=2, ensure_ascii=False)
         logger.info("Model saved to %s", output_dir)

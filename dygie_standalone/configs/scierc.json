@@ -66,6 +66,23 @@
   "focal_loss_gamma": 2.0,
   "_comment_focal_loss_gamma": "RE Focal Loss の gamma パラメータ。0 で通常の CrossEntropyLoss。2.0 が標準的な値。SciERC の RE は「関係なし」が多数派のため focal loss が効果的。",
 
+  "_comment_lora": "=== LoRA アダプタ オプション (v6) ===",
+
+  "use_lora": false,
+  "_comment_use_lora": "true にすると BERT エンコーダを大部分凍結し、LoRA アダプタのみ学習する。pip install peft が必要。小規模データ (SciERC: ~500文書) での過学習抑制・GPU メモリ削減に有効。",
+
+  "lora_r": 8,
+  "_comment_lora_r": "LoRA のランク。4〜16 が一般的。低いほどパラメータが少ない。",
+
+  "lora_alpha": 32,
+  "_comment_lora_alpha": "LoRA のスケーリング係数。通常 lora_r の 2〜4 倍に設定する。",
+
+  "lora_dropout": 0.1,
+  "_comment_lora_dropout": "LoRA アダプタ内の Dropout 率。",
+
+  "lora_target_modules": ["query", "value"],
+  "_comment_lora_target_modules": "LoRA を適用する BERT のモジュール名。['query', 'value'] が標準。['query', 'key', 'value', 'dense'] まで広げると表現力が上がる。",
+
   "_comment_ner_labels": "自動収集されます。手動指定したい場合は下記のコメントを外してください。",
   "_ner_labels_example": ["Task", "Method", "Metric", "Material", "OtherScientificTerm", "Generic"],
   "_rel_labels_example": ["Used-for", "Feature-of", "Hyponym-of", "Part-of", "Compare", "Conjunction", "Evaluate-for", "Coref-of"]

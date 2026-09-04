@@ -652,6 +652,98 @@ def test_event_forward():
         os.unlink(event_path)
 
 
+def test_lora_forward():
+    """
+    LoRA (use_lora=True) が有効なとき:
+      1. 学習可能パラメータ数が総数より少ない（BERT が凍結されている）
+      2. forward pass が正常に動作し、損失が NaN でない
+      3. backward pass が通る（LoRA A/B 行列のみ勾配が付く）
+
+    peft ライブラリがインストールされていない場合はスキップする。
+    """
+    try:
+        import peft  # noqa: F401
+    except ImportError:
+        print("  [SKIP] LoRA test: peft not installed (pip install peft)")
+        return
+
+    tok = _TOK
+    ds = DyGIEDataset(SAMPLE, tok, max_span_width=4, max_total_length=128)
+    loader = DataLoader(ds, batch_size=2, collate_fn=collate_fn)
+    batch = next(iter(loader))
+
+    # LoRA 有効モデルを構築
+    model = DyGIE(
+        transformer_model=MODEL_NAME,
+        ner_labels=ds.ner_labels,
+        rel_labels=ds.rel_labels,
+        max_span_width=4,
+        use_ner=True,
+        use_rel=True,
+        use_coref=False,
+        feedforward_dim=64,
+        width_embedding_dim=32,
+        dropout=0.0,
+        # LoRA 設定
+        use_lora=True,
+        lora_r=4,
+        lora_alpha=8,
+        lora_dropout=0.0,
+        lora_target_modules=["query", "value"],
+    )
+
+    # (1) 学習可能パラメータが総数より少ないことを確認（BERT 凍結）
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total     = sum(p.numel() for p in model.parameters())
+    assert trainable < total, (
+        f"With LoRA, trainable params ({trainable}) should be < total ({total})"
+    )
+    ratio = 100.0 * trainable / max(total, 1)
+
+    # (2) forward pass
+    model.eval()
+    with torch.no_grad():
+        out = model(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            token_to_subword=batch["token_to_subword"],
+            spans=batch["spans"],
+            span_mask=batch["span_mask"],
+            num_tokens=batch["num_tokens"],
+            ner_labels=batch["ner_labels"],
+            rel_labels=batch["rel_labels"],
+            use_gold_spans=True,
+        )
+    assert "loss" in out, "loss missing from LoRA model output"
+    assert not out["loss"].isnan().item(), "LoRA model loss is NaN"
+
+    # (3) backward pass — LoRA A/B 行列のみ勾配が付くことを確認
+    model.train()
+    out_train = model(
+        input_ids=batch["input_ids"],
+        attention_mask=batch["attention_mask"],
+        token_to_subword=batch["token_to_subword"],
+        spans=batch["spans"],
+        span_mask=batch["span_mask"],
+        num_tokens=batch["num_tokens"],
+        ner_labels=batch["ner_labels"],
+        rel_labels=batch["rel_labels"],
+        use_gold_spans=True,
+    )
+    out_train["loss"].backward()
+
+    # 凍結パラメータに勾配が付いていないことを確認
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            assert param.grad is None, \
+                f"Frozen param {name} should have no gradient, but grad is not None"
+
+    print(
+        f"  [OK] LoRA forward/backward: loss={out['loss'].item():.4f} | "
+        f"trainable={trainable:,} / {total:,} ({ratio:.2f}%)"
+    )
+
+
 if __name__ == "__main__":
     tests = [
         ("Dataset",                           test_dataset),
@@ -666,6 +758,7 @@ if __name__ == "__main__":
         ("Coref distance embedding",          test_coref_distance_embedding),
         ("Event Metrics",                     test_event_metrics),
         ("Event Forward + Loss",              test_event_forward),
+        ("LoRA forward/backward",             test_lora_forward),
     ]
     print("\n===== DyGIE++ Standalone Smoke Tests =====")
     passed = failed = 0
