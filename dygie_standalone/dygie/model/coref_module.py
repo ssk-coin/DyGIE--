@@ -92,17 +92,32 @@ class CorefModule(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     # ------------------------------------------------------------------
-    # Forward
+    # Forward (2 フェーズ構成)
     # ------------------------------------------------------------------
 
-    def forward(
+    def compute_representations(
         self,
-        span_repr: torch.Tensor,                      # [B, K, span_dim]
-        span_mask: torch.Tensor,                      # [B, K]
-        spans: torch.Tensor,                          # [B, K, 2]
-        num_tokens: torch.Tensor,                     # [B]
-        coref_clusters: list[list[list[tuple]]] | None = None,
+        span_repr: torch.Tensor,    # [B, K, span_dim]
+        span_mask: torch.Tensor,    # [B, K]
+        spans: torch.Tensor,        # [B, K, 2]
+        num_tokens: torch.Tensor,   # [B]
     ) -> dict[str, torch.Tensor]:
+        """
+        フェーズ 1: mention スコアリング・pruning・antecedent スコアリング。
+
+        損失は計算しない。返り値は SpanPropagation と predict_labels に渡す。
+        DyGIE++ 論文の実行順序:
+            compute_representations → coref_propagation → update_spans
+            → NER → predict_labels → RE
+
+        Returns
+        -------
+        dict with keys:
+          mention_scores    : [B, K]
+          top_span_indices  : [B, T]
+          top_span_mask     : [B, T]
+          antecedent_scores : [B, T, T+1]
+        """
         B, K, D = span_repr.shape
         device = span_repr.device
 
@@ -123,7 +138,6 @@ class CorefModule(nn.Module):
             scores_b = mention_scores[b]
             _, top_idx = scores_b.topk(T_b, dim=0)
             top_idx, _ = top_idx.sort()
-            # T にパディング（同じインデックスを繰り返し）
             if T_b < T:
                 pad = top_idx[-1:].expand(T - T_b)
                 top_idx = torch.cat([top_idx, pad], dim=0)
@@ -137,33 +151,70 @@ class CorefModule(nn.Module):
         )  # [B, T, D]
         top_mention_scores = mention_scores.gather(1, top_indices)  # [B, T]
 
-        # top span マスク（パディングした部分を除く）
+        # top span マスク
         top_mask = torch.zeros(B, T, dtype=torch.bool, device=device)
         for b in range(B):
             top_mask[b, : T_list[b]] = True
 
         # ---- (3) antecedent スコアリング ----
-        # 各 mention i に対して i より前の mention j を antecedent 候補とする
-        # antecedent スコア: [B, T, T]  (i, j) = score(i→j), j < i のみ有効
         ant_scores = self._score_antecedents(
             top_repr, top_mention_scores, top_indices, top_mask, spans
-        )  # [B, T, T+1]  (index 0 = dummy antecedent)
+        )  # [B, T, T+1]
 
-        output: dict[str, torch.Tensor] = {
-            "mention_scores": mention_scores,
+        return {
+            "mention_scores":   mention_scores,
             "top_span_indices": top_indices,
-            "top_span_mask": top_mask,
+            "top_span_mask":    top_mask,
             "antecedent_scores": ant_scores,
         }
 
-        # ---- (4) loss ----
-        if coref_clusters is not None:
-            loss = self._coref_loss(
-                ant_scores, top_indices, top_mask, spans, coref_clusters, B, T, device
-            )
-            output["coref_loss"] = loss
+    def predict_labels(
+        self,
+        coref_repr: dict[str, torch.Tensor],
+        spans: torch.Tensor,                          # [B, K, 2]
+        coref_clusters: list[list[list[tuple]]] | None,
+    ) -> dict[str, torch.Tensor]:
+        """
+        フェーズ 2: クラスタ割り当て + 損失計算。
+        NER の後、RE の前に呼び出す。
+        DyGIE++ 原論文 (Wadden et al., 2019) の
+        ``predict_labels`` に相当する。
 
-        return output
+        Parameters
+        ----------
+        coref_repr : compute_representations() の返り値。
+        spans      : [B, K, 2]
+        coref_clusters : gold クラスタ（学習時のみ; 推論時は None）。
+
+        Returns
+        -------
+        coref_repr に "coref_loss" を追加した dict（損失がある場合のみ）。
+        """
+        if coref_clusters is None:
+            return coref_repr
+
+        ant_scores  = coref_repr["antecedent_scores"]
+        top_indices = coref_repr["top_span_indices"]
+        top_mask    = coref_repr["top_span_mask"]
+        B, T        = top_indices.shape
+        device      = ant_scores.device
+
+        loss = self._coref_loss(
+            ant_scores, top_indices, top_mask, spans, coref_clusters, B, T, device
+        )
+        return {**coref_repr, "coref_loss": loss}
+
+    def forward(
+        self,
+        span_repr: torch.Tensor,                      # [B, K, span_dim]
+        span_mask: torch.Tensor,                      # [B, K]
+        spans: torch.Tensor,                          # [B, K, 2]
+        num_tokens: torch.Tensor,                     # [B]
+        coref_clusters: list[list[list[tuple]]] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """後方互換 API。両フェーズをまとめて呼び出す（テスト用）。"""
+        out = self.compute_representations(span_repr, span_mask, spans, num_tokens)
+        return self.predict_labels(out, spans, coref_clusters)
 
     # ------------------------------------------------------------------
     # Internal helpers

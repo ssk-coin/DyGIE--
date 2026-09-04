@@ -317,34 +317,47 @@ class DyGIE(nn.Module):
         output: dict[str, Any] = {}
         total_loss = torch.tensor(0.0, device=input_ids.device)
 
-        # ---- Coreference (論文に従い NER/RE より先に実行) ----
-        # DyGIE++ (Wadden et al., 2019) の実行順序:
-        #   span_repr → Coref → SpanPropagation → NER → RE
+        # ====================================================================
+        # DyGIE++ (Wadden et al., 2019) の実行順序を忠実に再現する:
+        #
+        #   [Phase 1] coref.compute_representations()
+        #       mention scoring + Top-T pruning + antecedent scoring
+        #   [Phase 2] coref_propagation (SpanPropagation, Section 3.3)
+        #       antecedent scores を辺として span_repr をグラフ伝播で更新
+        #   [Phase 3] NER   ← 伝播後の span_repr を使用
+        #   [Phase 4] coref.predict_labels()
+        #       クラスタ割り当て + coref 損失計算  ← NER の後、RE の前
+        #   [Phase 5] RE    ← 伝播後の span_repr を使用
+        #   [Phase 6] Events ← 伝播後の span_repr を使用
+        # ====================================================================
+
+        # ---- Phase 1: Coref compute_representations ----
+        coref_repr: dict[str, Any] | None = None
         if self.coref_module is not None:
-            coref_out = self.coref_module(
+            coref_repr = self.coref_module.compute_representations(
                 span_repr=span_repr,
                 span_mask=span_mask,
                 spans=spans,
                 num_tokens=num_tokens,
-                coref_clusters=coref_clusters,
             )
-            output.update(coref_out)
-            if "coref_loss" in coref_out:
-                total_loss = total_loss + self.coref_loss_weight * coref_out["coref_loss"]
+            # antecedent_scores は SpanProp と出力に使用（損失はまだ計算しない）
+            output["mention_scores"]    = coref_repr["mention_scores"]
+            output["top_span_indices"]  = coref_repr["top_span_indices"]
+            output["top_span_mask"]     = coref_repr["top_span_mask"]
+            output["antecedent_scores"] = coref_repr["antecedent_scores"]
 
-            # ---- Span Graph Propagation (Section 3.3) ----
-            # Coref クラスタを辺として span_repr を GRU スタイルで更新する。
-            # 更新後の span_repr を NER・RE で使用することで、
-            # 同一エンティティの複数スパン間で情報共有が可能になる。
-            if self.span_prop is not None:
-                span_repr = self.span_prop(
-                    span_repr=span_repr,
-                    top_span_indices=coref_out["top_span_indices"],
-                    top_span_mask=coref_out["top_span_mask"],
-                    antecedent_scores=coref_out["antecedent_scores"],
-                )
+        # ---- Phase 2: Span Graph Propagation (Section 3.3) ----
+        # Coref antecedent scores を辺として GRU スタイルでスパン表現を更新する。
+        # 同一エンティティの複数スパン間で情報を共有し、NER・RE の精度を向上させる。
+        if self.span_prop is not None and coref_repr is not None:
+            span_repr = self.span_prop(
+                span_repr=span_repr,
+                top_span_indices=coref_repr["top_span_indices"],
+                top_span_mask=coref_repr["top_span_mask"],
+                antecedent_scores=coref_repr["antecedent_scores"],
+            )
 
-        # ---- NER (伝播後の span_repr を使用) ----
+        # ---- Phase 3: NER (伝播後の span_repr を使用) ----
         if self.ner_module is not None:
             ner_out = self.ner_module(
                 span_repr=span_repr,
@@ -359,7 +372,19 @@ class DyGIE(nn.Module):
                 span_repr.shape[:2], dtype=torch.long, device=input_ids.device
             )
 
-        # ---- Relation Extraction (伝播後の span_repr を使用) ----
+        # ---- Phase 4: coref.predict_labels (NER の後・RE の前) ----
+        # 原論文の順序に従い、クラスタ割り当てと coref 損失計算を NER の後に実行する。
+        if self.coref_module is not None and coref_repr is not None:
+            coref_repr = self.coref_module.predict_labels(
+                coref_repr=coref_repr,
+                spans=spans,
+                coref_clusters=coref_clusters,
+            )
+            if "coref_loss" in coref_repr:
+                output["coref_loss"] = coref_repr["coref_loss"]
+                total_loss = total_loss + self.coref_loss_weight * coref_repr["coref_loss"]
+
+        # ---- Phase 5: Relation Extraction (伝播後の span_repr を使用) ----
         if self.rel_module is not None:
             rel_out = self.rel_module(
                 span_repr=span_repr,
@@ -367,16 +392,14 @@ class DyGIE(nn.Module):
                 ner_preds=output["ner_preds"],
                 rel_labels=rel_labels,
                 ner_labels=ner_labels,
-                spans=spans,                   # 距離特徴量のためにスパン位置を渡す
+                spans=spans,
                 use_gold_spans=use_gold_spans,
             )
             output.update(rel_out)
             if "rel_loss" in rel_out:
                 total_loss = total_loss + self.rel_loss_weight * rel_out["rel_loss"]
 
-        # ---- Event Extraction ----
-        # 実行順序: Coref → SpanProp → NER → RE → Event
-        # イベントトリガー検出と引数抽出は伝播後の span_repr を使用する。
+        # ---- Phase 6: Event Extraction (伝播後の span_repr を使用) ----
         if self.event_module is not None:
             event_out = self.event_module(
                 span_repr=span_repr,
@@ -385,7 +408,6 @@ class DyGIE(nn.Module):
                 event_arg_labels=event_arg_labels,
                 use_gold_triggers=use_gold_spans,
             )
-            # キー名に "event_" プレフィックスを付けて output に統合
             for k, v in event_out.items():
                 output[f"event_{k}" if not k.startswith("event_") else k] = v
             if "event_loss" in event_out:
