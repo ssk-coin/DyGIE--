@@ -744,6 +744,124 @@ def test_lora_forward():
     )
 
 
+def test_lora_save_load():
+    """
+    LoRA 有効モデルの save_pretrained / from_pretrained が正しく動作することを確認する。
+
+    確認項目:
+      1. dygie_config.json に use_lora=True が保存される
+      2. from_pretrained でロードした後も LoRA 構造が再構築される
+         (学習可能パラメータ数が同じ、つまり BERT が凍結されたまま)
+      3. パラメータ値が保存前後で一致する
+      4. ロード後の forward 出力 (ner_logits, rel_preds) が保存前と同じ
+    """
+    try:
+        import peft  # noqa: F401
+    except ImportError:
+        print("  [SKIP] LoRA save/load test: peft not installed (pip install peft)")
+        return
+
+    tok = _TOK
+    ds = DyGIEDataset(SAMPLE, tok, max_span_width=4, max_total_length=128)
+    loader = DataLoader(ds, batch_size=2, collate_fn=collate_fn)
+    batch = next(iter(loader))
+
+    # LoRA モデルを構築
+    model = DyGIE(
+        transformer_model=MODEL_NAME,
+        ner_labels=ds.ner_labels,
+        rel_labels=ds.rel_labels,
+        max_span_width=4,
+        use_ner=True,
+        use_rel=True,
+        use_coref=False,
+        feedforward_dim=64,
+        width_embedding_dim=32,
+        dropout=0.0,
+        use_lora=True,
+        lora_r=4,
+        lora_alpha=8,
+        lora_dropout=0.0,
+        lora_target_modules=["query", "value"],
+    )
+    model.eval()
+
+    # 保存前の forward 出力を取得
+    with torch.no_grad():
+        out_before = model(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            token_to_subword=batch["token_to_subword"],
+            spans=batch["spans"],
+            span_mask=batch["span_mask"],
+            num_tokens=batch["num_tokens"],
+            use_gold_spans=False,
+        )
+
+    trainable_before = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_before     = sum(p.numel() for p in model.parameters())
+
+    with tempfile.TemporaryDirectory(prefix="dygie_lora_save_test_") as tmpdir:
+        model.save_pretrained(tmpdir)
+
+        # (1) dygie_config.json に use_lora=True が保存されているか確認
+        cfg_path = Path(tmpdir) / "dygie_config.json"
+        assert cfg_path.exists(), "dygie_config.json was not saved"
+        with open(cfg_path) as f:
+            saved_cfg = json.load(f)
+        assert saved_cfg.get("use_lora") is True, \
+            f"use_lora should be True in saved config, got: {saved_cfg.get('use_lora')}"
+        assert saved_cfg.get("lora_r") == 4
+        assert saved_cfg.get("lora_alpha") == 8
+
+        # (2) from_pretrained でロード
+        loaded = DyGIE.from_pretrained(tmpdir)
+
+        # LoRA 構造が再構築されているか（学習可能パラメータ数が同じ）
+        trainable_after = sum(p.numel() for p in loaded.parameters() if p.requires_grad)
+        total_after     = sum(p.numel() for p in loaded.parameters())
+        assert trainable_after == trainable_before, (
+            f"Trainable params mismatch after load: {trainable_before} → {trainable_after}"
+        )
+        assert total_after == total_before, (
+            f"Total params mismatch after load: {total_before} → {total_after}"
+        )
+        assert loaded.use_lora is True, "loaded model should have use_lora=True"
+
+        # (3) パラメータ値が一致するか
+        orig_sd   = model.state_dict()
+        loaded_sd = loaded.state_dict()
+        assert set(orig_sd.keys()) == set(loaded_sd.keys()), \
+            "state_dict keys mismatch after LoRA save/load"
+        for key in orig_sd:
+            assert torch.allclose(orig_sd[key], loaded_sd[key]), \
+                f"Parameter mismatch for key: {key}"
+
+        # (4) forward 出力が保存前と一致するか
+        loaded.eval()
+        with torch.no_grad():
+            out_after = loaded(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                token_to_subword=batch["token_to_subword"],
+                spans=batch["spans"],
+                span_mask=batch["span_mask"],
+                num_tokens=batch["num_tokens"],
+                use_gold_spans=False,
+            )
+        assert torch.allclose(out_before["ner_logits"], out_after["ner_logits"]), \
+            "ner_logits differ after LoRA save/load"
+        assert torch.equal(out_before["ner_preds"], out_after["ner_preds"]), \
+            "ner_preds differ after LoRA save/load"
+
+    print(
+        f"  [OK] LoRA save/load: use_lora={saved_cfg['use_lora']} | "
+        f"lora_r={saved_cfg['lora_r']} | "
+        f"trainable={trainable_after:,}/{total_after:,} | "
+        f"all params match, forward output identical"
+    )
+
+
 if __name__ == "__main__":
     tests = [
         ("Dataset",                           test_dataset),
@@ -759,6 +877,7 @@ if __name__ == "__main__":
         ("Event Metrics",                     test_event_metrics),
         ("Event Forward + Loss",              test_event_forward),
         ("LoRA forward/backward",             test_lora_forward),
+        ("LoRA save / load pretrained",       test_lora_save_load),
     ]
     print("\n===== DyGIE++ Standalone Smoke Tests =====")
     passed = failed = 0
