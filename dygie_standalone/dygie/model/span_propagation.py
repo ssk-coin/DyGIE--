@@ -1,5 +1,5 @@
 """
-DyGIE++ Standalone — Span Graph Propagation Module (v5)
+DyGIE-- — Span Graph Propagation Module (v5)
 
 Wadden et al. (2019) Section 3.3 の GRU スタイルスパングラフ伝播を実装する。
 
