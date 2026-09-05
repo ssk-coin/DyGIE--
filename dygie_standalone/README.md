@@ -1,4 +1,4 @@
-# DyGIE++ Standalone
+# DyGIE-- (DyGIE++ Standalone)
 
 AllenNLP **不要**の DyGIE++ 再実装です。  
 PyTorch + HuggingFace Transformers のみで動作します。
