@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DyGIE++ Standalone — 推論スクリプト
+DyGIE-- — 推論スクリプト
 
 使い方:
   python scripts/predict.py \
