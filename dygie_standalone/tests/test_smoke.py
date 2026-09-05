@@ -862,6 +862,79 @@ def test_lora_save_load():
     )
 
 
+def test_early_stopping_metric():
+    """early_stopping_metric の省略形・フルキー・auto・存在しないキーを検証する。"""
+    from dygie.training.trainer import Trainer, _METRIC_ALIASES
+
+    # ダミー metrics dict（実際の評価結果を模倣）
+    dev_metrics = {
+        "ner_f1": 0.80,
+        "rel_f1": 0.65,
+        "conll_f1": 0.72,
+        "event_trigger_f1": 0.55,
+        "event_arg_f1": 0.40,
+    }
+
+    ds = DyGIEDataset(SAMPLE, _TOK, max_span_width=4, max_total_length=128)
+    loader = DataLoader(ds, batch_size=2, collate_fn=collate_fn)
+
+    def make_trainer(metric: str) -> Trainer:
+        model = DyGIE(
+            transformer_model=MODEL_NAME,
+            ner_labels=ds.ner_labels,
+            rel_labels=ds.rel_labels,
+            max_span_width=4,
+            feedforward_dim=64,
+            width_embedding_dim=32,
+            dropout=0.0,
+        )
+        return Trainer(
+            model=model,
+            train_loader=loader,
+            dev_loader=loader,
+            output_dir=tempfile.mkdtemp(prefix="dygie_es_test_"),
+            num_epochs=1,
+            patience=0,
+            early_stopping_metric=metric,
+        )
+
+    # 省略形のエイリアス展開確認
+    for alias, full in _METRIC_ALIASES.items():
+        t = make_trainer(alias)
+        assert t.early_stopping_metric == full, (
+            f"alias '{alias}' should expand to '{full}', got '{t.early_stopping_metric}'"
+        )
+
+    # フルキー指定
+    t = make_trainer("rel_f1")
+    assert t._select_score(dev_metrics) == 0.65, "rel_f1 should return 0.65"
+
+    t = make_trainer("conll_f1")
+    assert t._select_score(dev_metrics) == 0.72, "conll_f1 should return 0.72"
+
+    t = make_trainer("event_arg_f1")
+    assert t._select_score(dev_metrics) == 0.40, "event_arg_f1 should return 0.40"
+
+    # auto: NER が最優先
+    t = make_trainer("auto")
+    assert t._select_score(dev_metrics) == 0.80, "auto should pick ner_f1=0.80"
+
+    # auto: NER がないとき RE を選択
+    t2 = make_trainer("auto")
+    assert t2._select_score({"rel_f1": 0.65, "conll_f1": 0.72}) == 0.65, \
+        "auto without ner_f1 should pick rel_f1"
+
+    # 存在しないキー → 0.0 を返す（警告）
+    t3 = make_trainer("nonexistent_f1")
+    score = t3._select_score(dev_metrics)
+    assert score == 0.0, f"nonexistent key should return 0.0, got {score}"
+
+    print(
+        "  [OK] early_stopping_metric: "
+        "省略形展開 OK | フルキー OK | auto OK | 存在しないキー→0.0 OK"
+    )
+
+
 def test_seed_reproducibility():
     """同じシードで 2 回 forward した結果が一致し、異なるシードでは変わることを確認する。"""
     import random, os
@@ -950,6 +1023,7 @@ if __name__ == "__main__":
         ("Event Forward + Loss",              test_event_forward),
         ("LoRA forward/backward",             test_lora_forward),
         ("LoRA save / load pretrained",       test_lora_save_load),
+        ("Early stopping metric selection",   test_early_stopping_metric),
         ("Seed reproducibility",              test_seed_reproducibility),
     ]
     print("\n===== DyGIE++ Standalone Smoke Tests =====")
