@@ -5,11 +5,11 @@
 
   "use_ner":   true,
   "use_rel":   true,
-  "use_coref": true,
+  "use_coref": false,
 
-  "ner_loss_weight":   1.0,
+  "ner_loss_weight":   0.2,
   "rel_loss_weight":   1.0,
-  "coref_loss_weight": 1.0,
+  "coref_loss_weight": 0.0,
   "use_gold_spans_for_rel": true,
 
   "width_embedding_dim":  128,
@@ -32,7 +32,7 @@
   "use_amp": false,
   "_comment_use_amp": "true にすると自動混合精度 (AMP) を有効化。CUDA 環境のみ有効。学習速度向上・GPU メモリ削減。",
 
-  "patience": 5,
+  "patience": 0,
   "_comment_patience": "Early stopping の待機エポック数。0 で無効（全エポック学習）。",
 
   "early_stopping_warmup": 20,
