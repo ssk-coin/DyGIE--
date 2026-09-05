@@ -55,8 +55,40 @@ def parse_args() -> argparse.Namespace:
                    help="自動混合精度 (AMP) を有効化（CUDA 環境のみ）")
     p.add_argument("--patience",          type=int,   default=None,
                    help="Early stopping のエポック数（0=無効）")
+    p.add_argument("--early_stopping_warmup", type=int, default=None,
+                   help="Early stopping を開始するまでのウォームアップエポック数（デフォルト 20）")
     p.add_argument("--gradient_accumulation_steps", type=int, default=None,
                    help="勾配蓄積ステップ数（デフォルト 1）")
+    # メモリ最適化オプション
+    p.add_argument("--use_gradient_checkpointing", action="store_true", default=None,
+                   help="Transformer エンコーダに勾配チェックポイントを適用（メモリ削減）")
+    p.add_argument("--max_spans",         type=int,   default=None,
+                   help="文書あたりの最大スパン数（0=上限なし）。RE の K×K メモリを削減する。")
+    # RE スコア改善オプション (v4)
+    p.add_argument("--type_embedding_dim", type=int,   default=None,
+                   help="RE エンティティタイプ埋め込みの次元数（0=無効）")
+    p.add_argument("--use_distance_feature", action="store_true", default=None,
+                   help="RE スパン間距離特徴を有効化")
+    p.add_argument("--num_distance_buckets", type=int,   default=None,
+                   help="距離バケット数（デフォルト 10）")
+    p.add_argument("--distance_embedding_dim", type=int,   default=None,
+                   help="距離埋め込みの次元数（0=無効）")
+    p.add_argument("--focal_loss_gamma",  type=float, default=None,
+                   help="RE Focal Loss の gamma 値（0=通常の CE、2.0 が推奨）")
+    # イベント抽出オプション
+    p.add_argument("--use_event",         action="store_true", default=None,
+                   help="イベント抽出タスクを有効化")
+    p.add_argument("--event_loss_weight", type=float, default=None,
+                   help="イベント抽出損失の重み（デフォルト 1.0）")
+    # LoRA オプション (v6)
+    p.add_argument("--use_lora",          action="store_true", default=None,
+                   help="LoRA (Low-Rank Adaptation) を有効化（pip install peft 必要）")
+    p.add_argument("--lora_r",            type=int,   default=None,
+                   help="LoRA のランク（デフォルト 8）")
+    p.add_argument("--lora_alpha",        type=int,   default=None,
+                   help="LoRA のスケーリング係数（デフォルト 32）")
+    p.add_argument("--lora_dropout",      type=float, default=None,
+                   help="LoRA アダプタ内の Dropout 率（デフォルト 0.1）")
     return p.parse_args()
 
 
@@ -69,13 +101,30 @@ def main() -> None:
     # CLI 引数で設定を上書き
     for key in ["transformer_model", "num_epochs", "batch_size",
                 "lr_transformer", "lr_task", "device",
-                "patience", "gradient_accumulation_steps"]:
+                "patience", "early_stopping_warmup", "gradient_accumulation_steps", "max_spans",
+                "type_embedding_dim", "num_distance_buckets",
+                "distance_embedding_dim", "focal_loss_gamma"]:
         val = getattr(args, key, None)
         if val is not None:
             cfg[key] = val
-    # use_amp は store_true なので None チェック不要
+    # store_true フラグは None チェック不要
     if args.use_amp:
         cfg["use_amp"] = True
+    if args.use_gradient_checkpointing:
+        cfg["use_gradient_checkpointing"] = True
+    if args.use_distance_feature:
+        cfg["use_distance_feature"] = True
+    if args.use_event:
+        cfg["use_event"] = True
+    if args.event_loss_weight is not None:
+        cfg["event_loss_weight"] = args.event_loss_weight
+    # LoRA (store_true / int / float)
+    if args.use_lora:
+        cfg["use_lora"] = True
+    for key in ["lora_r", "lora_alpha", "lora_dropout"]:
+        val = getattr(args, key, None)
+        if val is not None:
+            cfg[key] = val
 
     logger.info("Config: %s", json.dumps(cfg, indent=2, ensure_ascii=False))
 
@@ -83,6 +132,7 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(cfg["transformer_model"])
 
     # ---- Dataset ----
+    use_event = cfg.get("use_event", False)
     train_ds = DyGIEDataset(
         path=args.train_path,
         tokenizer=tokenizer,
@@ -91,6 +141,8 @@ def main() -> None:
         use_ner=cfg.get("use_ner", True),
         use_rel=cfg.get("use_rel", True),
         use_coref=cfg.get("use_coref", True),
+        use_event=use_event,
+        max_spans=cfg.get("max_spans", 0),
     )
     dev_ds = DyGIEDataset(
         path=args.dev_path,
@@ -99,9 +151,13 @@ def main() -> None:
         max_total_length=cfg.get("max_total_length", 512),
         ner_labels=train_ds.ner_labels,
         rel_labels=train_ds.rel_labels,
+        event_type_labels=train_ds.event_type_labels if use_event else None,
+        arg_role_labels=train_ds.arg_role_labels if use_event else None,
         use_ner=cfg.get("use_ner", True),
         use_rel=cfg.get("use_rel", True),
         use_coref=cfg.get("use_coref", True),
+        use_event=use_event,
+        max_spans=cfg.get("max_spans", 0),
     )
 
     batch_size = cfg.get("batch_size", 4)
@@ -138,6 +194,24 @@ def main() -> None:
         spans_per_word=cfg.get("spans_per_word", 0.4),
         max_top_antecedents=cfg.get("max_top_antecedents", 50),
         dropout=cfg.get("dropout", 0.4),
+        use_gradient_checkpointing=cfg.get("use_gradient_checkpointing", False),
+        # v4: RE スコア改善
+        type_embedding_dim=cfg.get("type_embedding_dim", 0),
+        use_distance_feature=cfg.get("use_distance_feature", False),
+        num_distance_buckets=cfg.get("num_distance_buckets", 10),
+        distance_embedding_dim=cfg.get("distance_embedding_dim", 64),
+        focal_loss_gamma=cfg.get("focal_loss_gamma", 0.0),
+        # v5: イベント抽出
+        use_event=use_event,
+        event_type_labels=train_ds.event_type_labels if use_event else None,
+        arg_role_labels=train_ds.arg_role_labels if use_event else None,
+        event_loss_weight=cfg.get("event_loss_weight", 1.0),
+        # v6: LoRA
+        use_lora=cfg.get("use_lora", False),
+        lora_r=cfg.get("lora_r", 8),
+        lora_alpha=cfg.get("lora_alpha", 32),
+        lora_dropout=cfg.get("lora_dropout", 0.1),
+        lora_target_modules=cfg.get("lora_target_modules", None),
     )
 
     # ---- Trainer ----
@@ -156,17 +230,22 @@ def main() -> None:
         log_every=cfg.get("log_every", 50),
         use_amp=cfg.get("use_amp", False),
         patience=cfg.get("patience", 0),
+        early_stopping_warmup=cfg.get("early_stopping_warmup", 20),
         gradient_accumulation_steps=cfg.get("gradient_accumulation_steps", 1),
     )
 
     # ラベル情報と設定を保存
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
+    label_info = {
+        "ner_labels": train_ds.ner_labels,
+        "rel_labels": train_ds.rel_labels,
+    }
+    if use_event:
+        label_info["event_type_labels"] = train_ds.event_type_labels
+        label_info["arg_role_labels"] = train_ds.arg_role_labels
     with open(out / "labels.json", "w") as f:
-        json.dump(
-            {"ner_labels": train_ds.ner_labels, "rel_labels": train_ds.rel_labels},
-            f, indent=2,
-        )
+        json.dump(label_info, f, indent=2)
     with open(out / "config.json", "w") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
 

@@ -14,6 +14,8 @@ AllenNLP の Trainer を置き換える純粋な PyTorch 学習ループ。
   - AMP (自動混合精度) 学習サポート (use_amp=True, CUDA 環境のみ)
   - Early stopping サポート (patience > 0 で有効)
   - Gradient accumulation サポート (gradient_accumulation_steps > 1 で有効)
+  - Early stopping ウォームアップ: early_stopping_warmup エポック中は
+    patience カウンタを増加させず、安定前の停止を防ぐ
 """
 
 from __future__ import annotations
@@ -31,7 +33,7 @@ from torch.utils.data import DataLoader
 from transformers import get_linear_schedule_with_warmup
 
 from ..model.dygie import DyGIE
-from .metrics import NERMetrics, RelationMetrics, CorefMetrics
+from .metrics import NERMetrics, RelationMetrics, CorefMetrics, EventMetrics
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +65,10 @@ class Trainer:
     patience : int
         Early stopping の待機エポック数。0 で無効（常に全エポック学習）。
         dev スコアが patience エポック改善しない場合に学習を停止する。
+    early_stopping_warmup : int
+        Early stopping を有効化するまでのウォームアップエポック数（デフォルト 20）。
+        最初のこのエポック数の間は patience カウンタを増加させない。
+        学習初期のスコアが不安定な期間に誤って停止するのを防ぐ。
     gradient_accumulation_steps : int
         勾配蓄積ステップ数。1 で通常通り毎ステップ更新。
         メモリが少ない環境で実効バッチサイズを増やすために使用する。
@@ -84,6 +90,7 @@ class Trainer:
         log_every: int = 50,
         use_amp: bool = False,
         patience: int = 0,
+        early_stopping_warmup: int = 20,
         gradient_accumulation_steps: int = 1,
     ) -> None:
         self.model = model
@@ -96,6 +103,7 @@ class Trainer:
         self.use_gold_spans_for_rel = use_gold_spans_for_rel
         self.log_every = log_every
         self.patience = patience
+        self.early_stopping_warmup = max(0, early_stopping_warmup)
         self.gradient_accumulation_steps = max(1, gradient_accumulation_steps)
 
         # device
@@ -113,10 +121,17 @@ class Trainer:
         if self.use_amp:
             logger.info("AMP (automatic mixed precision) enabled.")
 
-        # optimizer: Transformer と task head を分離
-        encoder_params = list(model.encoder.parameters())
+        # optimizer: Transformer（または LoRA アダプタ）と task head を分離
+        # LoRA 有効時: encoder の凍結パラメータ (requires_grad=False) を除外し、
+        #              LoRA の A/B 行列のみ lr_transformer で更新する。
+        encoder_params = [
+            p for p in model.encoder.parameters() if p.requires_grad
+        ]
         encoder_ids = {id(p) for p in encoder_params}
-        task_params = [p for p in model.parameters() if id(p) not in encoder_ids]
+        task_params = [
+            p for p in model.parameters()
+            if id(p) not in encoder_ids and p.requires_grad
+        ]
 
         self.optimizer = torch.optim.AdamW(
             [
@@ -141,6 +156,7 @@ class Trainer:
         self.ner_metrics = NERMetrics()
         self.rel_metrics = RelationMetrics()
         self.coref_metrics = CorefMetrics()
+        self.event_metrics = EventMetrics()
 
         self.best_dev_score = -1.0
         self._patience_counter = 0
@@ -176,21 +192,34 @@ class Trainer:
                 self._save_checkpoint("best")
                 logger.info("  ↑ New best score: %.4f", score)
             else:
-                self._patience_counter += 1
-                logger.info(
-                    "  No improvement. Patience: %d/%d",
-                    self._patience_counter,
-                    self.patience if self.patience > 0 else float("inf"),
-                )
+                # ウォームアップ期間中は patience カウンタを増加させない
+                if epoch > self.early_stopping_warmup:
+                    self._patience_counter += 1
+                    patience_limit = str(self.patience) if self.patience > 0 else "∞"
+                    logger.info(
+                        "  No improvement. Patience: %d/%s",
+                        self._patience_counter,
+                        patience_limit,
+                    )
+                else:
+                    logger.info(
+                        "  No improvement (warmup epoch %d/%d — patience not counted).",
+                        epoch,
+                        self.early_stopping_warmup,
+                    )
 
             self._save_checkpoint("last")
 
-            # Early stopping
-            if self.patience > 0 and self._patience_counter >= self.patience:
+            # Early stopping（ウォームアップ期間後のみ判定）
+            if (
+                self.patience > 0
+                and epoch > self.early_stopping_warmup
+                and self._patience_counter >= self.patience
+            ):
                 logger.info(
-                    "Early stopping triggered at epoch %d (patience=%d). "
+                    "Early stopping triggered at epoch %d (patience=%d, warmup=%d). "
                     "Best score: %.4f",
-                    epoch, self.patience, self.best_dev_score,
+                    epoch, self.patience, self.early_stopping_warmup, self.best_dev_score,
                 )
                 break
 
@@ -227,6 +256,10 @@ class Trainer:
                     ner_labels=batch.get("ner_labels"),
                     rel_labels=batch.get("rel_labels"),
                     coref_clusters=batch.get("coref_clusters"),
+                    event_trigger_labels=batch.get("event_trigger_labels")
+                        if self.model.use_event else None,
+                    event_arg_labels=batch.get("event_arg_labels")
+                        if self.model.use_event else None,
                     use_gold_spans=self.use_gold_spans_for_rel,
                 )
 
@@ -274,6 +307,7 @@ class Trainer:
         self.ner_metrics.reset()
         self.rel_metrics.reset()
         self.coref_metrics.reset()
+        self.event_metrics.reset()
 
         for batch in loader:
             batch = self._to_device(batch)
@@ -284,7 +318,7 @@ class Trainer:
                 spans=batch["spans"],
                 span_mask=batch["span_mask"],
                 num_tokens=batch["num_tokens"],
-                use_gold_spans=False,  # 推論時は predicted NER を使用
+                use_gold_spans=False,  # 推論時は predicted NER / trigger を使用
             )
 
             if self.model.use_ner and "ner_preds" in outputs:
@@ -314,6 +348,16 @@ class Trainer:
                         gold_clusters=batch["coref_clusters"][b],
                     )
 
+            if self.model.use_event and "event_trigger_preds" in outputs:
+                self.event_metrics.update(
+                    trigger_preds=outputs["event_trigger_preds"].cpu(),
+                    trigger_golds=batch["event_trigger_labels"].cpu(),
+                    arg_preds=outputs["event_arg_preds"].cpu(),
+                    arg_golds=batch["event_arg_labels"].cpu(),
+                    span_mask=batch["span_mask"].cpu(),
+                    arg_mask=outputs["event_arg_mask"].cpu(),
+                )
+
         metrics: dict[str, float] = {}
         if self.model.use_ner:
             metrics.update(self.ner_metrics.compute())
@@ -321,6 +365,8 @@ class Trainer:
             metrics.update(self.rel_metrics.compute())
         if self.model.use_coref:
             metrics.update(self.coref_metrics.compute())
+        if self.model.use_event:
+            metrics.update(self.event_metrics.compute())
 
         return metrics
 

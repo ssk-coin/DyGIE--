@@ -35,8 +35,53 @@
   "patience": 5,
   "_comment_patience": "Early stopping の待機エポック数。0 で無効（全エポック学習）。",
 
+  "early_stopping_warmup": 20,
+  "_comment_early_stopping_warmup": "Early stopping を開始するまでのウォームアップエポック数。最初のこのエポック数の間は patience カウンタを増加させない。学習初期のスコアが不安定な期間に誤って停止するのを防ぐ。",
+
   "gradient_accumulation_steps": 1,
   "_comment_gradient_accumulation_steps": "勾配蓄積ステップ数。バッチサイズを増やせない場合に実効バッチサイズを増やす。例: 4 なら実効バッチサイズは batch_size × 4。",
+
+  "_comment_memory": "=== メモリ最適化オプション (v3) ===",
+
+  "use_gradient_checkpointing": true,
+  "_comment_use_gradient_checkpointing": "Transformer エンコーダに勾配チェックポイントを適用。エンコーダの活性化メモリを 50〜70% 削減（学習速度は約 1.3x 低下）。CUDA 環境で OOM が発生する場合に有効。",
+
+  "max_spans": 0,
+  "_comment_max_spans": "文書あたりの最大スパン数（0=上限なし）。RE の K×K ペア行列のメモリを削減する。例: 800 に設定すると K を 800 に制限。エンティティが多い文書には 1000〜1500 が推奨。",
+
+  "_comment_re_v4": "=== RE スコア改善オプション (v4) ===",
+
+  "type_embedding_dim": 128,
+  "_comment_type_embedding_dim": "エンティティタイプ埋め込みの次元数。RE ペア表現に NER ラベル情報を追加する（最大の改善効果）。0 で無効。SciERC のような multi-type データに特に有効。",
+
+  "use_distance_feature": true,
+  "_comment_use_distance_feature": "スパン間距離特徴を RE ペア表現に追加する。近距離のエンティティペアほど関係ありの確率が高い傾向を学習できる。",
+
+  "num_distance_buckets": 10,
+  "_comment_num_distance_buckets": "距離バケット数（ログスケール）。デフォルトの 10 は: 0, 1-2, 3-6, 7-14, 15-30, 31-62, 63-126, 127-254, 255-510, 511+ トークンのバケット。",
+
+  "distance_embedding_dim": 64,
+  "_comment_distance_embedding_dim": "距離埋め込みの次元数。0 で use_distance_feature=true でも無効化。",
+
+  "focal_loss_gamma": 2.0,
+  "_comment_focal_loss_gamma": "RE Focal Loss の gamma パラメータ。0 で通常の CrossEntropyLoss。2.0 が標準的な値。SciERC の RE は「関係なし」が多数派のため focal loss が効果的。",
+
+  "_comment_lora": "=== LoRA アダプタ オプション (v6) ===",
+
+  "use_lora": false,
+  "_comment_use_lora": "true にすると BERT エンコーダを大部分凍結し、LoRA アダプタのみ学習する。pip install peft が必要。小規模データ (SciERC: ~500文書) での過学習抑制・GPU メモリ削減に有効。",
+
+  "lora_r": 8,
+  "_comment_lora_r": "LoRA のランク。4〜16 が一般的。低いほどパラメータが少ない。",
+
+  "lora_alpha": 32,
+  "_comment_lora_alpha": "LoRA のスケーリング係数。通常 lora_r の 2〜4 倍に設定する。",
+
+  "lora_dropout": 0.1,
+  "_comment_lora_dropout": "LoRA アダプタ内の Dropout 率。",
+
+  "lora_target_modules": ["query", "value"],
+  "_comment_lora_target_modules": "LoRA を適用する BERT のモジュール名。['query', 'value'] が標準。['query', 'key', 'value', 'dense'] まで広げると表現力が上がる。",
 
   "_comment_ner_labels": "自動収集されます。手動指定したい場合は下記のコメントを外してください。",
   "_ner_labels_example": ["Task", "Method", "Metric", "Material", "OtherScientificTerm", "Generic"],

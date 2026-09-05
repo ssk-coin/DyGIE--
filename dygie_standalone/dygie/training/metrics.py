@@ -126,6 +126,98 @@ class RelationMetrics:
 
 
 # =====================================================================
+# Event Metrics  (Trigger F1 / Argument F1)
+# =====================================================================
+
+class EventMetrics:
+    """
+    イベント抽出の評価指標。
+
+    - Trigger F1 : (span, event_type) の完全一致スパンレベル micro F1
+    - Argument F1: (trigger_span, arg_span, role) の完全一致スパンペアレベル micro F1
+
+    Usage::
+        metrics = EventMetrics()
+        metrics.update(trigger_preds, trigger_golds, arg_preds, arg_golds,
+                       span_mask, arg_mask)
+        result = metrics.compute()
+    """
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        # Trigger
+        self.trig_tp = 0
+        self.trig_fp = 0
+        self.trig_fn = 0
+        # Argument
+        self.arg_tp = 0
+        self.arg_fp = 0
+        self.arg_fn = 0
+
+    def update(
+        self,
+        trigger_preds: torch.Tensor,    # [B, K]
+        trigger_golds: torch.Tensor,    # [B, K]
+        arg_preds: torch.Tensor,        # [B, K, K]
+        arg_golds: torch.Tensor,        # [B, K, K]
+        span_mask: torch.Tensor,        # [B, K]
+        arg_mask: torch.Tensor,         # [B, K, K]  有効 (trigger, arg) ペア
+    ) -> None:
+        B = trigger_preds.size(0)
+        for b in range(B):
+            mask = span_mask[b]
+            tp = trigger_preds[b][mask]
+            tg = trigger_golds[b][mask]
+            # Trigger
+            for p, g in zip(tp.tolist(), tg.tolist()):
+                if g > 0 and p == g:
+                    self.trig_tp += 1
+                elif p > 0 and p != g:
+                    self.trig_fp += 1
+                    if g > 0:
+                        self.trig_fn += 1
+                elif g > 0 and p == 0:
+                    self.trig_fn += 1
+                elif p > 0 and g == 0:
+                    self.trig_fp += 1
+            # Argument
+            am = arg_mask[b]
+            ap = arg_preds[b][am]
+            ag = arg_golds[b][am]
+            for p, g in zip(ap.tolist(), ag.tolist()):
+                if g > 0 and p == g:
+                    self.arg_tp += 1
+                elif p > 0 and p != g:
+                    self.arg_fp += 1
+                    if g > 0:
+                        self.arg_fn += 1
+                elif g > 0 and p == 0:
+                    self.arg_fn += 1
+                elif p > 0 and g == 0:
+                    self.arg_fp += 1
+
+    def compute(self) -> dict[str, float]:
+        def _prf(tp: int, fp: int, fn: int) -> tuple[float, float, float]:
+            p = tp / (tp + fp + 1e-9)
+            r = tp / (tp + fn + 1e-9)
+            f = 2 * p * r / (p + r + 1e-9)
+            return p, r, f
+
+        tp_p, tp_r, tp_f = _prf(self.trig_tp, self.trig_fp, self.trig_fn)
+        ap_p, ap_r, ap_f = _prf(self.arg_tp,  self.arg_fp,  self.arg_fn)
+        return {
+            "event_trigger_precision": tp_p,
+            "event_trigger_recall":    tp_r,
+            "event_trigger_f1":        tp_f,
+            "event_arg_precision":     ap_p,
+            "event_arg_recall":        ap_r,
+            "event_arg_f1":            ap_f,
+        }
+
+
+# =====================================================================
 # Coreference Metrics  (MUC / B³ / CEAFφ4)
 # =====================================================================
 

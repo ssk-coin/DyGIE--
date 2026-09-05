@@ -25,9 +25,10 @@ from transformers import BertConfig, BertModel, BertTokenizerFast, PreTrainedTok
 
 from dygie.data import DyGIEDataset, collate_fn
 from dygie.model import DyGIE
-from dygie.training.metrics import NERMetrics, RelationMetrics, CorefMetrics
+from dygie.training.metrics import NERMetrics, RelationMetrics, CorefMetrics, EventMetrics
 
 SAMPLE = Path(__file__).parent.parent / "data" / "sample" / "sample.jsonl"
+SAMPLE_EVENT = Path(__file__).parent.parent / "data" / "sample" / "sample_event.jsonl"
 
 # ---- ダミー BERT をローカルに生成（外部通信不要） ----
 _DUMMY_DIR = Path(tempfile.mkdtemp(prefix="dygie_test_bert_"))
@@ -151,11 +152,13 @@ def test_forward_with_loss():
     assert "loss" in out, "loss missing"
     assert not out["loss"].isnan().item(), "loss is NaN"
     assert "ner_logits" in out
-    assert "rel_logits" in out
+    # rel_logits は v3 からメモリ削減のため出力しない（rel_preds / pair_mask を使用）
+    assert "rel_preds" in out
+    assert "pair_mask" in out
     assert "antecedent_scores" in out
     print(f"  [OK] Forward+Loss: loss={out['loss'].item():.4f} | "
           f"ner_logits={tuple(out['ner_logits'].shape)} | "
-          f"rel_logits={tuple(out['rel_logits'].shape)}")
+          f"rel_preds={tuple(out['rel_preds'].shape)}")
 
 
 def test_inference_no_labels():
@@ -338,6 +341,74 @@ def test_backward():
     print(f"  [OK] Backward pass: loss={loss.item():.4f}")
 
 
+def test_re_v4_features():
+    """
+    v4 RE 改善: エンティティタイプ埋め込み / 距離特徴 / Focal Loss が
+    正しく動作し、損失が NaN でないことを確認する。
+    """
+    tok = _TOK
+    ds = DyGIEDataset(SAMPLE, tok, max_span_width=4, max_total_length=128)
+    loader = DataLoader(ds, batch_size=2, collate_fn=collate_fn)
+    batch = next(iter(loader))
+
+    # 全 v4 機能を有効化
+    model = DyGIE(
+        transformer_model=MODEL_NAME,
+        ner_labels=ds.ner_labels,
+        rel_labels=ds.rel_labels,
+        max_span_width=4,
+        use_ner=True,
+        use_rel=True,
+        use_coref=False,
+        feedforward_dim=64,
+        width_embedding_dim=32,
+        dropout=0.0,
+        # v4
+        type_embedding_dim=32,       # エンティティタイプ埋め込み
+        use_distance_feature=True,   # 距離特徴
+        num_distance_buckets=10,
+        distance_embedding_dim=16,
+        focal_loss_gamma=2.0,        # Focal Loss
+    )
+    model.eval()
+
+    with torch.no_grad():
+        out = model(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            token_to_subword=batch["token_to_subword"],
+            spans=batch["spans"],
+            span_mask=batch["span_mask"],
+            num_tokens=batch["num_tokens"],
+            ner_labels=batch["ner_labels"],
+            rel_labels=batch["rel_labels"],
+            use_gold_spans=True,
+        )
+
+    assert "loss" in out, "loss missing"
+    assert not out["loss"].isnan().item(), "loss is NaN with v4 features"
+    assert "rel_preds" in out
+    assert "pair_mask" in out
+
+    # backward も確認
+    model.train()
+    out2 = model(
+        input_ids=batch["input_ids"],
+        attention_mask=batch["attention_mask"],
+        token_to_subword=batch["token_to_subword"],
+        spans=batch["spans"],
+        span_mask=batch["span_mask"],
+        num_tokens=batch["num_tokens"],
+        ner_labels=batch["ner_labels"],
+        rel_labels=batch["rel_labels"],
+        use_gold_spans=True,
+    )
+    out2["loss"].backward()
+
+    print(f"  [OK] RE v4 features: loss={out['loss'].item():.4f} | "
+          f"pair_mask nonzero={out['pair_mask'].sum().item():.0f} pairs")
+
+
 def test_coref_distance_embedding():
     """
     coref の antecedent 距離埋め込みが正しく適用されているか確認する。
@@ -383,6 +454,414 @@ def test_coref_distance_embedding():
           "causal masking verified")
 
 
+def test_event_metrics():
+    """EventMetrics が trigger / argument の F1 を正しく計算することを確認する。"""
+    metrics = EventMetrics()
+
+    B, K = 1, 4
+    # trigger_preds[b, k]: pred label (0=none, 1=type_A)
+    # gold: span 0 is type_A, span 2 is type_A; pred: span 0 correct, span 2 missed, span 3 false positive
+    trigger_preds = torch.tensor([[1, 0, 0, 1]])  # TP=1, FP=1, FN=1
+    trigger_golds = torch.tensor([[1, 0, 1, 0]])
+    span_mask     = torch.tensor([[True, True, True, True]])
+
+    # arg: span 0 is trigger (gold), arg at span 1 with role 1
+    # pred: (0,1)=1 correct; (3,1)=1 false positive (trigger 3 is not in gold)
+    arg_preds = torch.zeros(B, K, K, dtype=torch.long)
+    arg_golds = torch.zeros(B, K, K, dtype=torch.long)
+    arg_mask  = torch.zeros(B, K, K, dtype=torch.bool)
+
+    arg_golds[0, 0, 1] = 1    # gold: trigger=0 → arg=1 with role 1
+    arg_preds[0, 0, 1] = 1    # pred: TP
+    arg_preds[0, 3, 1] = 1    # pred: FP (trigger 3 is not in gold)
+    arg_mask[0, 0, 1]  = True
+    arg_mask[0, 3, 1]  = True  # trigger 3 predicted (but not gold)
+
+    metrics.update(trigger_preds, trigger_golds, arg_preds, arg_golds, span_mask, arg_mask)
+    r = metrics.compute()
+
+    assert "event_trigger_f1" in r
+    assert "event_arg_f1" in r
+    assert 0 <= r["event_trigger_f1"] <= 1
+    assert 0 <= r["event_arg_f1"] <= 1
+    # trigger: tp=1, fp=1, fn=1 → P=R=F1=0.5
+    assert abs(r["event_trigger_f1"] - 0.5) < 1e-3, \
+        f"Trigger F1 expected 0.5, got {r['event_trigger_f1']:.4f}"
+    print(f"  [OK] EventMetrics: trigger_F1={r['event_trigger_f1']:.4f}, "
+          f"arg_F1={r['event_arg_f1']:.4f}")
+
+
+def test_event_forward():
+    """イベント抽出モデルの forward pass と損失が正常に動作することを確認する。"""
+    import json
+    import tempfile
+
+    # ---- 合成イベントデータを一時ファイルに作成 ----
+    # ドキュメント全体でフラットなトークンインデックスを使用
+    # doc: sentences[0] = ["John", "died", "in", "Paris", "."] (tokens 0-4)
+    #       sentences[1] = ["Mary", "was", "born", "in", "London", "."] (tokens 5-10)
+    # events: sentence 0: trigger "died" (token 1) → Life:Die; arg "John" (0) = Person
+    #         sentence 1: trigger "born" (token 7) → Life:Be-Born; arg "Mary" (5) = Person
+    event_docs = [
+        {
+            "doc_key": "evt_001",
+            "dataset": "ace05",
+            "sentences": [
+                ["John", "died", "in", "Paris", "."],
+                ["Mary", "was", "born", "in", "London", "."],
+            ],
+            "ner": [[[0, 0, "PER"], [3, 3, "GPE"]], [[5, 5, "PER"], [9, 9, "GPE"]]],
+            "relations": [[], []],
+            "events": [
+                # sentence 0 events: flat token indices
+                [[[1, 1, "Life:Die"], [0, 0, "Person"]]],
+                # sentence 1 events
+                [[[7, 7, "Life:Be-Born"], [5, 5, "Person"]]],
+            ],
+        },
+        {
+            "doc_key": "evt_002",
+            "dataset": "ace05",
+            "sentences": [
+                ["The", "company", "merged", "yesterday", "."],
+            ],
+            "ner": [[[1, 1, "ORG"]]],
+            "relations": [[]],
+            "events": [
+                [[[2, 2, "Business:Merge-Org"], [1, 1, "Org"]]],
+            ],
+        },
+        {
+            "doc_key": "evt_003",
+            "dataset": "ace05",
+            "sentences": [
+                ["He", "won", "the", "election", "."],
+            ],
+            "ner": [[[0, 0, "PER"]]],
+            "relations": [[]],
+            "events": [
+                [[[1, 1, "Personnel:Elect"], [0, 0, "Person"]]],
+            ],
+        },
+    ]
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as tf:
+        for doc in event_docs:
+            tf.write(json.dumps(doc) + "\n")
+        event_path = tf.name
+
+    try:
+        tok = _TOK
+        ds = DyGIEDataset(
+            event_path, tok,
+            max_span_width=4, max_total_length=128,
+            use_ner=True, use_rel=False, use_coref=False, use_event=True,
+        )
+
+        assert len(ds.event_type_labels) > 0, "No event type labels collected"
+        assert len(ds.arg_role_labels) > 0, "No arg role labels collected"
+
+        loader = DataLoader(ds, batch_size=2, collate_fn=collate_fn)
+        batch = next(iter(loader))
+
+        # 合成データにイベントラベルが含まれることを確認
+        assert "event_trigger_labels" in batch, "event_trigger_labels missing from batch"
+        assert "event_arg_labels" in batch, "event_arg_labels missing from batch"
+        # 少なくとも1つのトリガーが存在するはず
+        assert batch["event_trigger_labels"].max().item() > 0, \
+            "No positive trigger labels found in batch"
+
+        # モデル構築
+        model = DyGIE(
+            transformer_model=MODEL_NAME,
+            ner_labels=ds.ner_labels,
+            rel_labels=ds.rel_labels,
+            max_span_width=4,
+            use_ner=True,
+            use_rel=False,
+            use_coref=False,
+            use_event=True,
+            event_type_labels=ds.event_type_labels,
+            arg_role_labels=ds.arg_role_labels,
+            feedforward_dim=64,
+            width_embedding_dim=32,
+            dropout=0.0,
+        )
+        model.eval()
+
+        with torch.no_grad():
+            out = model(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                token_to_subword=batch["token_to_subword"],
+                spans=batch["spans"],
+                span_mask=batch["span_mask"],
+                num_tokens=batch["num_tokens"],
+                ner_labels=batch["ner_labels"],
+                event_trigger_labels=batch["event_trigger_labels"],
+                event_arg_labels=batch["event_arg_labels"],
+                use_gold_spans=True,
+            )
+
+        assert "loss" in out, "loss missing from event model output"
+        assert not out["loss"].isnan().item(), "event model loss is NaN"
+        assert "event_trigger_preds" in out, "event_trigger_preds missing"
+        assert "event_arg_preds" in out, "event_arg_preds missing"
+        assert "event_arg_mask" in out, "event_arg_mask missing"
+        assert "event_loss" in out, "event_loss missing"
+
+        # 推論モード（ラベルなし）
+        with torch.no_grad():
+            out_inf = model(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                token_to_subword=batch["token_to_subword"],
+                spans=batch["spans"],
+                span_mask=batch["span_mask"],
+                num_tokens=batch["num_tokens"],
+                use_gold_spans=False,
+            )
+        assert "loss" not in out_inf, "loss should not appear in inference mode"
+        assert "event_trigger_preds" in out_inf
+        assert "event_arg_preds" in out_inf
+
+        # backward パス
+        model.train()
+        out_train = model(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            token_to_subword=batch["token_to_subword"],
+            spans=batch["spans"],
+            span_mask=batch["span_mask"],
+            num_tokens=batch["num_tokens"],
+            ner_labels=batch["ner_labels"],
+            event_trigger_labels=batch["event_trigger_labels"],
+            event_arg_labels=batch["event_arg_labels"],
+            use_gold_spans=True,
+        )
+        out_train["loss"].backward()
+
+        print(
+            f"  [OK] Event Forward: loss={out['loss'].item():.4f} | "
+            f"event_loss={out['event_loss'].item():.4f} | "
+            f"trigger_labels={ds.event_type_labels} | "
+            f"arg_roles={ds.arg_role_labels}"
+        )
+    finally:
+        import os
+        os.unlink(event_path)
+
+
+def test_lora_forward():
+    """
+    LoRA (use_lora=True) が有効なとき:
+      1. 学習可能パラメータ数が総数より少ない（BERT が凍結されている）
+      2. forward pass が正常に動作し、損失が NaN でない
+      3. backward pass が通る（LoRA A/B 行列のみ勾配が付く）
+
+    peft ライブラリがインストールされていない場合はスキップする。
+    """
+    try:
+        import peft  # noqa: F401
+    except ImportError:
+        print("  [SKIP] LoRA test: peft not installed (pip install peft)")
+        return
+
+    tok = _TOK
+    ds = DyGIEDataset(SAMPLE, tok, max_span_width=4, max_total_length=128)
+    loader = DataLoader(ds, batch_size=2, collate_fn=collate_fn)
+    batch = next(iter(loader))
+
+    # LoRA 有効モデルを構築
+    model = DyGIE(
+        transformer_model=MODEL_NAME,
+        ner_labels=ds.ner_labels,
+        rel_labels=ds.rel_labels,
+        max_span_width=4,
+        use_ner=True,
+        use_rel=True,
+        use_coref=False,
+        feedforward_dim=64,
+        width_embedding_dim=32,
+        dropout=0.0,
+        # LoRA 設定
+        use_lora=True,
+        lora_r=4,
+        lora_alpha=8,
+        lora_dropout=0.0,
+        lora_target_modules=["query", "value"],
+    )
+
+    # (1) 学習可能パラメータが総数より少ないことを確認（BERT 凍結）
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total     = sum(p.numel() for p in model.parameters())
+    assert trainable < total, (
+        f"With LoRA, trainable params ({trainable}) should be < total ({total})"
+    )
+    ratio = 100.0 * trainable / max(total, 1)
+
+    # (2) forward pass
+    model.eval()
+    with torch.no_grad():
+        out = model(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            token_to_subword=batch["token_to_subword"],
+            spans=batch["spans"],
+            span_mask=batch["span_mask"],
+            num_tokens=batch["num_tokens"],
+            ner_labels=batch["ner_labels"],
+            rel_labels=batch["rel_labels"],
+            use_gold_spans=True,
+        )
+    assert "loss" in out, "loss missing from LoRA model output"
+    assert not out["loss"].isnan().item(), "LoRA model loss is NaN"
+
+    # (3) backward pass — LoRA A/B 行列のみ勾配が付くことを確認
+    model.train()
+    out_train = model(
+        input_ids=batch["input_ids"],
+        attention_mask=batch["attention_mask"],
+        token_to_subword=batch["token_to_subword"],
+        spans=batch["spans"],
+        span_mask=batch["span_mask"],
+        num_tokens=batch["num_tokens"],
+        ner_labels=batch["ner_labels"],
+        rel_labels=batch["rel_labels"],
+        use_gold_spans=True,
+    )
+    out_train["loss"].backward()
+
+    # 凍結パラメータに勾配が付いていないことを確認
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            assert param.grad is None, \
+                f"Frozen param {name} should have no gradient, but grad is not None"
+
+    print(
+        f"  [OK] LoRA forward/backward: loss={out['loss'].item():.4f} | "
+        f"trainable={trainable:,} / {total:,} ({ratio:.2f}%)"
+    )
+
+
+def test_lora_save_load():
+    """
+    LoRA 有効モデルの save_pretrained / from_pretrained が正しく動作することを確認する。
+
+    確認項目:
+      1. dygie_config.json に use_lora=True が保存される
+      2. from_pretrained でロードした後も LoRA 構造が再構築される
+         (学習可能パラメータ数が同じ、つまり BERT が凍結されたまま)
+      3. パラメータ値が保存前後で一致する
+      4. ロード後の forward 出力 (ner_logits, rel_preds) が保存前と同じ
+    """
+    try:
+        import peft  # noqa: F401
+    except ImportError:
+        print("  [SKIP] LoRA save/load test: peft not installed (pip install peft)")
+        return
+
+    tok = _TOK
+    ds = DyGIEDataset(SAMPLE, tok, max_span_width=4, max_total_length=128)
+    loader = DataLoader(ds, batch_size=2, collate_fn=collate_fn)
+    batch = next(iter(loader))
+
+    # LoRA モデルを構築
+    model = DyGIE(
+        transformer_model=MODEL_NAME,
+        ner_labels=ds.ner_labels,
+        rel_labels=ds.rel_labels,
+        max_span_width=4,
+        use_ner=True,
+        use_rel=True,
+        use_coref=False,
+        feedforward_dim=64,
+        width_embedding_dim=32,
+        dropout=0.0,
+        use_lora=True,
+        lora_r=4,
+        lora_alpha=8,
+        lora_dropout=0.0,
+        lora_target_modules=["query", "value"],
+    )
+    model.eval()
+
+    # 保存前の forward 出力を取得
+    with torch.no_grad():
+        out_before = model(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            token_to_subword=batch["token_to_subword"],
+            spans=batch["spans"],
+            span_mask=batch["span_mask"],
+            num_tokens=batch["num_tokens"],
+            use_gold_spans=False,
+        )
+
+    trainable_before = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_before     = sum(p.numel() for p in model.parameters())
+
+    with tempfile.TemporaryDirectory(prefix="dygie_lora_save_test_") as tmpdir:
+        model.save_pretrained(tmpdir)
+
+        # (1) dygie_config.json に use_lora=True が保存されているか確認
+        cfg_path = Path(tmpdir) / "dygie_config.json"
+        assert cfg_path.exists(), "dygie_config.json was not saved"
+        with open(cfg_path) as f:
+            saved_cfg = json.load(f)
+        assert saved_cfg.get("use_lora") is True, \
+            f"use_lora should be True in saved config, got: {saved_cfg.get('use_lora')}"
+        assert saved_cfg.get("lora_r") == 4
+        assert saved_cfg.get("lora_alpha") == 8
+
+        # (2) from_pretrained でロード
+        loaded = DyGIE.from_pretrained(tmpdir)
+
+        # LoRA 構造が再構築されているか（学習可能パラメータ数が同じ）
+        trainable_after = sum(p.numel() for p in loaded.parameters() if p.requires_grad)
+        total_after     = sum(p.numel() for p in loaded.parameters())
+        assert trainable_after == trainable_before, (
+            f"Trainable params mismatch after load: {trainable_before} → {trainable_after}"
+        )
+        assert total_after == total_before, (
+            f"Total params mismatch after load: {total_before} → {total_after}"
+        )
+        assert loaded.use_lora is True, "loaded model should have use_lora=True"
+
+        # (3) パラメータ値が一致するか
+        orig_sd   = model.state_dict()
+        loaded_sd = loaded.state_dict()
+        assert set(orig_sd.keys()) == set(loaded_sd.keys()), \
+            "state_dict keys mismatch after LoRA save/load"
+        for key in orig_sd:
+            assert torch.allclose(orig_sd[key], loaded_sd[key]), \
+                f"Parameter mismatch for key: {key}"
+
+        # (4) forward 出力が保存前と一致するか
+        loaded.eval()
+        with torch.no_grad():
+            out_after = loaded(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                token_to_subword=batch["token_to_subword"],
+                spans=batch["spans"],
+                span_mask=batch["span_mask"],
+                num_tokens=batch["num_tokens"],
+                use_gold_spans=False,
+            )
+        assert torch.allclose(out_before["ner_logits"], out_after["ner_logits"]), \
+            "ner_logits differ after LoRA save/load"
+        assert torch.equal(out_before["ner_preds"], out_after["ner_preds"]), \
+            "ner_preds differ after LoRA save/load"
+
+    print(
+        f"  [OK] LoRA save/load: use_lora={saved_cfg['use_lora']} | "
+        f"lora_r={saved_cfg['lora_r']} | "
+        f"trainable={trainable_after:,}/{total_after:,} | "
+        f"all params match, forward output identical"
+    )
+
+
 if __name__ == "__main__":
     tests = [
         ("Dataset",                           test_dataset),
@@ -393,7 +872,12 @@ if __name__ == "__main__":
         ("Coref P/R independence",            test_coref_metrics_precision_recall_independence),
         ("Save / Load pretrained",            test_save_load_pretrained),
         ("Backward pass",                     test_backward),
+        ("RE v4 features",                    test_re_v4_features),
         ("Coref distance embedding",          test_coref_distance_embedding),
+        ("Event Metrics",                     test_event_metrics),
+        ("Event Forward + Loss",              test_event_forward),
+        ("LoRA forward/backward",             test_lora_forward),
+        ("LoRA save / load pretrained",       test_lora_save_load),
     ]
     print("\n===== DyGIE++ Standalone Smoke Tests =====")
     passed = failed = 0

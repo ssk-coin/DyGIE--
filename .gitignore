@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+develop-eggs/
+.installed.cfg
+lib/
+lib64/
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# pytest
+.pytest_cache/
+.cache/
+
+# Coverage
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+
+# Distribution
+*.tar.gz
+*.zip
+
+# Model outputs / checkpoints (大容量のため除外)
+output/
+*.pt
+*.bin
+*.safetensors
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

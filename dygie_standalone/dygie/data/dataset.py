@@ -9,7 +9,18 @@ SciERC / DyGIE++ JSON Lines 形式を読み込み、PyTorch Dataset として提
   "sentences": [[token, ...], ...],          # 必須
   "ner":       [[[start, end, label], ...], ...],   # optional
   "relations": [[[s1, e1, s2, e2, label], ...], ...], # optional
-  "clusters":  [[[start, end], ...], ...]    # optional (coref)
+  "clusters":  [[[start, end], ...], ...],   # optional (coref)
+  "events":    [                             # optional (event extraction)
+    [                                        # sentence events
+      [                                      # single event
+        [trigger_start, trigger_end, event_type],   # index 0 = trigger
+        [arg_start, arg_end, role],                 # index 1+ = arguments
+        ...
+      ],
+      ...
+    ],
+    ...
+  ]
 }
 すべてのインデックスはドキュメント全体でのフラットなトークンインデックス。
 """
@@ -62,9 +73,13 @@ class DyGIEDataset(Dataset):
         max_total_length: int = 512,
         ner_labels: list[str] | None = None,
         rel_labels: list[str] | None = None,
+        event_type_labels: list[str] | None = None,
+        arg_role_labels: list[str] | None = None,
         use_ner: bool = True,
         use_rel: bool = True,
         use_coref: bool = True,
+        use_event: bool = False,
+        max_spans: int = 0,
     ) -> None:
         self.tokenizer = tokenizer
         self.max_span_width = max_span_width
@@ -72,10 +87,14 @@ class DyGIEDataset(Dataset):
         self.use_ner = use_ner
         self.use_rel = use_rel
         self.use_coref = use_coref
+        self.use_event = use_event
+        self.max_spans = max_spans  # 0 = 上限なし
 
         # ---- ラベル辞書（外部指定 or ファイルから自動構築） ----
         self._ner_labels: list[str] = list(ner_labels) if ner_labels else []
         self._rel_labels: list[str] = list(rel_labels) if rel_labels else []
+        self._event_type_labels: list[str] = list(event_type_labels) if event_type_labels else []
+        self._arg_role_labels: list[str] = list(arg_role_labels) if arg_role_labels else []
 
         self.raw_docs: list[dict[str, Any]] = []
         with open(path, "r", encoding="utf-8") as f:
@@ -89,6 +108,11 @@ class DyGIEDataset(Dataset):
             self._ner_labels = self._collect_labels("ner", index=2)
         if not self._rel_labels and use_rel:
             self._rel_labels = self._collect_labels("relations", index=4)
+        if use_event:
+            if not self._event_type_labels:
+                self._event_type_labels = self._collect_event_type_labels()
+            if not self._arg_role_labels:
+                self._arg_role_labels = self._collect_arg_role_labels()
 
         self.ner_label2id: dict[str, int] = {
             lbl: i + 1 for i, lbl in enumerate(self._ner_labels)
@@ -96,6 +120,12 @@ class DyGIEDataset(Dataset):
         self.rel_label2id: dict[str, int] = {
             lbl: i + 1 for i, lbl in enumerate(self._rel_labels)
         }  # 0 = "no relation"
+        self.event_type_label2id: dict[str, int] = {
+            lbl: i + 1 for i, lbl in enumerate(self._event_type_labels)
+        }  # 0 = "no trigger"
+        self.arg_role_label2id: dict[str, int] = {
+            lbl: i + 1 for i, lbl in enumerate(self._arg_role_labels)
+        }  # 0 = "no role"
 
         # キャッシュ済みサンプル
         self._cache: list[dict[str, Any]] = [
@@ -103,11 +133,14 @@ class DyGIEDataset(Dataset):
         ]
 
         logger.info(
-            "Loaded %d documents from %s | NER labels: %d | RE labels: %d",
+            "Loaded %d documents from %s | NER labels: %d | RE labels: %d"
+            " | Event types: %d | Arg roles: %d",
             len(self._cache),
             path,
             len(self._ner_labels),
             len(self._rel_labels),
+            len(self._event_type_labels),
+            len(self._arg_role_labels),
         )
 
     # ------------------------------------------------------------------
@@ -121,6 +154,14 @@ class DyGIEDataset(Dataset):
     @property
     def rel_labels(self) -> list[str]:
         return self._rel_labels
+
+    @property
+    def event_type_labels(self) -> list[str]:
+        return self._event_type_labels
+
+    @property
+    def arg_role_labels(self) -> list[str]:
+        return self._arg_role_labels
 
     # ------------------------------------------------------------------
     # Dataset interface
@@ -144,6 +185,26 @@ class DyGIEDataset(Dataset):
                 for annot in sent_annots:
                     if len(annot) > index:
                         labels.add(annot[index])
+        return sorted(labels)
+
+    def _collect_event_type_labels(self) -> list[str]:
+        """events フィールドからイベントタイプラベルを収集する。"""
+        labels: set[str] = set()
+        for doc in self.raw_docs:
+            for sent_events in doc.get("events", []):
+                for event in sent_events:
+                    if event:  # event[0] = trigger [start, end, type]
+                        labels.add(event[0][2])
+        return sorted(labels)
+
+    def _collect_arg_role_labels(self) -> list[str]:
+        """events フィールドから引数ロールラベルを収集する。"""
+        labels: set[str] = set()
+        for doc in self.raw_docs:
+            for sent_events in doc.get("events", []):
+                for event in sent_events:
+                    for arg in event[1:]:  # arg = [start, end, role]
+                        labels.add(arg[2])
         return sorted(labels)
 
     def _process(self, doc: dict[str, Any]) -> dict[str, Any]:
@@ -247,16 +308,56 @@ class DyGIEDataset(Dataset):
             for cluster in doc.get("clusters", []):
                 coref_clusters.append([tuple(mention) for mention in cluster])
 
+        # ---- (6) Event トリガー・引数ラベル ----
+        # events 形式:
+        #   sentence_events = [event, ...]
+        #   event = [[trigger_start, trigger_end, event_type], [arg_start, arg_end, role], ...]
+        event_trigger_labels_tensor = torch.zeros(K, dtype=torch.long)
+        event_arg_labels_tensor = torch.zeros((K, K), dtype=torch.long)
+        if self.use_event:
+            for s_idx in range(len(sentences)):
+                sent_events = doc.get("events", [])
+                if s_idx >= len(sent_events):
+                    continue
+                for event in sent_events[s_idx]:
+                    if not event:
+                        continue
+                    # トリガー
+                    t_start, t_end, t_type = event[0][0], event[0][1], event[0][2]
+                    t_key = (t_start, t_end)
+                    t_k = span_index.get(t_key)
+                    if t_k is not None and t_type in self.event_type_label2id:
+                        event_trigger_labels_tensor[t_k] = self.event_type_label2id[t_type]
+                    # 引数
+                    for arg in event[1:]:
+                        a_start, a_end, role = arg[0], arg[1], arg[2]
+                        a_k = span_index.get((a_start, a_end))
+                        if t_k is not None and a_k is not None and role in self.arg_role_label2id:
+                            event_arg_labels_tensor[t_k, a_k] = self.arg_role_label2id[role]
+
+        # ---- (7) スパン数の上限設定（メモリ節約）----
+        # max_spans > 0 のとき、先頭 max_spans 件に切り捨てる。
+        # RE の pair 行列は O(K²) のため、K を抑えるとメモリが大幅に削減される。
+        if self.max_spans > 0 and K > self.max_spans:
+            cap = self.max_spans
+            spans_tensor = spans_tensor[:cap]
+            ner_labels_tensor = ner_labels_tensor[:cap]
+            rel_labels_tensor = rel_labels_tensor[:cap, :cap]
+            event_trigger_labels_tensor = event_trigger_labels_tensor[:cap]
+            event_arg_labels_tensor = event_arg_labels_tensor[:cap, :cap]
+
         return {
             "doc_key": doc_key,
             "input_ids": input_ids,
             "attention_mask": attention_mask,
-            "token_to_subword": token_to_subword,   # [N]
-            "subword_to_token": subword_to_token,   # [L]
+            "token_to_subword": token_to_subword,         # [N]
+            "subword_to_token": subword_to_token,         # [L]
             "sentence_offsets": torch.tensor(sentence_offsets, dtype=torch.long),  # [S, 2]
-            "spans": spans_tensor,                  # [K, 2]
-            "ner_labels": ner_labels_tensor,        # [K]
-            "rel_labels": rel_labels_tensor,        # [K, K]
-            "coref_clusters": coref_clusters,       # list[list[tuple]]
+            "spans": spans_tensor,                        # [K, 2]
+            "ner_labels": ner_labels_tensor,              # [K]
+            "rel_labels": rel_labels_tensor,              # [K, K]
+            "coref_clusters": coref_clusters,             # list[list[tuple]]
+            "event_trigger_labels": event_trigger_labels_tensor,  # [K]
+            "event_arg_labels": event_arg_labels_tensor,          # [K, K]
             "num_tokens": valid_num_tokens,
         }
