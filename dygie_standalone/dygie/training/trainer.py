@@ -1,5 +1,5 @@
 """
-DyGIE++ Standalone — Trainer
+DyGIE-- — Trainer
 
 AllenNLP の Trainer を置き換える純粋な PyTorch 学習ループ。
 
