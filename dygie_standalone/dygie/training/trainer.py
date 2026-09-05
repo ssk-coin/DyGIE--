@@ -16,6 +16,9 @@ AllenNLP の Trainer を置き換える純粋な PyTorch 学習ループ。
   - Gradient accumulation サポート (gradient_accumulation_steps > 1 で有効)
   - Early stopping ウォームアップ: early_stopping_warmup エポック中は
     patience カウンタを増加させず、安定前の停止を防ぐ
+
+改善点 (v8):
+  - early_stopping_metric: early stopping の判定に使うメトリクスを設定可能
 """
 
 from __future__ import annotations
@@ -36,6 +39,14 @@ from ..model.dygie import DyGIE
 from .metrics import NERMetrics, RelationMetrics, CorefMetrics, EventMetrics
 
 logger = logging.getLogger(__name__)
+
+# early stopping メトリクス省略形 → フルキー
+_METRIC_ALIASES: dict[str, str] = {
+    "ner":   "ner_f1",
+    "rel":   "rel_f1",
+    "coref": "conll_f1",
+    "event": "event_trigger_f1",
+}
 
 
 class Trainer:
@@ -69,6 +80,12 @@ class Trainer:
         Early stopping を有効化するまでのウォームアップエポック数（デフォルト 20）。
         最初のこのエポック数の間は patience カウンタを増加させない。
         学習初期のスコアが不安定な期間に誤って停止するのを防ぐ。
+    early_stopping_metric : str
+        Early stopping の判定に使うメトリクスキー（デフォルト "ner_f1"）。
+        省略形: "ner"→"ner_f1", "rel"→"rel_f1", "coref"→"conll_f1",
+                "event"→"event_trigger_f1"。
+        "auto" を指定すると有効タスクから自動選択（NER > RE > Coref > Event の優先順）。
+        フルキーも指定可: "rel_f1", "conll_f1", "event_arg_f1" など。
     gradient_accumulation_steps : int
         勾配蓄積ステップ数。1 で通常通り毎ステップ更新。
         メモリが少ない環境で実効バッチサイズを増やすために使用する。
@@ -91,6 +108,7 @@ class Trainer:
         use_amp: bool = False,
         patience: int = 0,
         early_stopping_warmup: int = 20,
+        early_stopping_metric: str = "ner_f1",
         gradient_accumulation_steps: int = 1,
     ) -> None:
         self.model = model
@@ -104,6 +122,10 @@ class Trainer:
         self.log_every = log_every
         self.patience = patience
         self.early_stopping_warmup = max(0, early_stopping_warmup)
+        # 省略形をフルキーに展開（"ner" → "ner_f1" など）
+        self.early_stopping_metric = _METRIC_ALIASES.get(
+            early_stopping_metric, early_stopping_metric
+        )
         self.gradient_accumulation_steps = max(1, gradient_accumulation_steps)
 
         # device
@@ -173,8 +195,8 @@ class Trainer:
             dev_metrics = self._evaluate(self.dev_loader)
             elapsed = time.time() - t0
 
-            # 主要スコア（NER F1 を優先、なければ RE F1）
-            score = dev_metrics.get("ner_f1", dev_metrics.get("rel_f1", 0.0))
+            # early stopping 判定スコアの選択
+            score = self._select_score(dev_metrics)
 
             record = {
                 "epoch": epoch,
@@ -190,7 +212,7 @@ class Trainer:
                 self.best_dev_score = score
                 self._patience_counter = 0
                 self._save_checkpoint("best")
-                logger.info("  ↑ New best score: %.4f", score)
+                logger.info("  ↑ New best %s: %.4f", self.early_stopping_metric, score)
             else:
                 # ウォームアップ期間中は patience カウンタを増加させない
                 if epoch > self.early_stopping_warmup:
@@ -217,9 +239,10 @@ class Trainer:
                 and self._patience_counter >= self.patience
             ):
                 logger.info(
-                    "Early stopping triggered at epoch %d (patience=%d, warmup=%d). "
-                    "Best score: %.4f",
-                    epoch, self.patience, self.early_stopping_warmup, self.best_dev_score,
+                    "Early stopping triggered at epoch %d "
+                    "(metric=%s, patience=%d, warmup=%d). Best score: %.4f",
+                    epoch, self.early_stopping_metric,
+                    self.patience, self.early_stopping_warmup, self.best_dev_score,
                 )
                 break
 
@@ -234,6 +257,30 @@ class Trainer:
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
+
+    def _select_score(self, dev_metrics: dict[str, float]) -> float:
+        """early_stopping_metric に従い dev_metrics からスコアを取得する。
+
+        "auto" の場合は有効タスクから NER > RE > Coref > Event の優先順で選択する。
+        指定したキーが dev_metrics に存在しない場合は警告を出し 0.0 を返す。
+        """
+        if self.early_stopping_metric == "auto":
+            # 有効タスクを優先順で確認
+            for key in ("ner_f1", "rel_f1", "conll_f1", "event_trigger_f1"):
+                if key in dev_metrics:
+                    return dev_metrics[key]
+            return 0.0
+
+        if self.early_stopping_metric not in dev_metrics:
+            available = list(dev_metrics.keys())
+            logger.warning(
+                "early_stopping_metric='%s' が dev_metrics にありません。"
+                "利用可能なキー: %s。0.0 を使用します。",
+                self.early_stopping_metric, available,
+            )
+            return 0.0
+
+        return dev_metrics[self.early_stopping_metric]
 
     def _train_epoch(self, epoch: int) -> float:
         self.model.train()

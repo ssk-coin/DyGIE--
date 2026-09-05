@@ -38,6 +38,9 @@
   "early_stopping_warmup": 20,
   "_comment_early_stopping_warmup": "Early stopping を開始するまでのウォームアップエポック数。最初のこのエポック数の間は patience カウンタを増加させない。学習初期のスコアが不安定な期間に誤って停止するのを防ぐ。",
 
+  "early_stopping_metric": "ner_f1",
+  "_comment_early_stopping_metric": "Early stopping の判定に使うメトリクス。省略形: 'ner'=ner_f1, 'rel'=rel_f1, 'coref'=conll_f1, 'event'=event_trigger_f1。フルキーも指定可: 'event_arg_f1' など。'auto' で有効タスクから自動選択（NER > RE > Coref > Event 優先）。",
+
   "gradient_accumulation_steps": 1,
   "_comment_gradient_accumulation_steps": "勾配蓄積ステップ数。バッチサイズを増やせない場合に実効バッチサイズを増やす。例: 4 なら実効バッチサイズは batch_size × 4。",
 

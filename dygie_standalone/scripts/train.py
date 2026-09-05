@@ -57,6 +57,11 @@ def parse_args() -> argparse.Namespace:
                    help="Early stopping のエポック数（0=無効）")
     p.add_argument("--early_stopping_warmup", type=int, default=None,
                    help="Early stopping を開始するまでのウォームアップエポック数（デフォルト 20）")
+    p.add_argument("--early_stopping_metric", type=str, default=None,
+                   help="Early stopping の判定メトリクス。"
+                        "省略形: ner/rel/coref/event。"
+                        "フルキー: ner_f1/rel_f1/conll_f1/event_trigger_f1/event_arg_f1 など。"
+                        "'auto' で有効タスクから自動選択（デフォルト: ner_f1）。")
     p.add_argument("--gradient_accumulation_steps", type=int, default=None,
                    help="勾配蓄積ステップ数（デフォルト 1）")
     # メモリ最適化オプション
@@ -122,7 +127,8 @@ def main() -> None:
     # CLI 引数で設定を上書き
     for key in ["transformer_model", "num_epochs", "batch_size",
                 "lr_transformer", "lr_task", "device",
-                "patience", "early_stopping_warmup", "gradient_accumulation_steps", "max_spans",
+                "patience", "early_stopping_warmup", "early_stopping_metric",
+                "gradient_accumulation_steps", "max_spans",
                 "type_embedding_dim", "num_distance_buckets",
                 "distance_embedding_dim", "focal_loss_gamma"]:
         val = getattr(args, key, None)
@@ -261,6 +267,7 @@ def main() -> None:
         use_amp=cfg.get("use_amp", False),
         patience=cfg.get("patience", 0),
         early_stopping_warmup=cfg.get("early_stopping_warmup", 20),
+        early_stopping_metric=cfg.get("early_stopping_metric", "ner_f1"),
         gradient_accumulation_steps=cfg.get("gradient_accumulation_steps", 1),
     )
 

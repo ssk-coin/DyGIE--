@@ -39,6 +39,9 @@
   "early_stopping_warmup": 20,
   "_comment_early_stopping_warmup": "最初の 20 エポックは early stopping を適用しない。",
 
+  "early_stopping_metric": "event_trigger_f1",
+  "_comment_early_stopping_metric": "ACE 2005 はイベント抽出が主タスクのため event_trigger_f1 で判定。'ner_f1'/'rel_f1'/'conll_f1'/'event_arg_f1' なども指定可。省略形: 'event'='event_trigger_f1'。",
+
   "gradient_accumulation_steps": 1,
 
   "use_gradient_checkpointing": false,
