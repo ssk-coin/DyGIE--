@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DyGIE++ Standalone — 学習スクリプト
+DyGIE-- — 学習スクリプト
 
 使い方:
   python scripts/train.py \
