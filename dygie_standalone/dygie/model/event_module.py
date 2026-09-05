@@ -1,5 +1,5 @@
 """
-DyGIE++ Standalone — Event Extraction Module (v5)
+DyGIE-- — Event Extraction Module (v5)
 
 イベント抽出は 2 段階のタスクで構成される:
   1. トリガー検出 (Trigger Detection):
