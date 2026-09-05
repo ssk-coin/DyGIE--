@@ -1,5 +1,5 @@
 """
-DyGIE++ Standalone — Collate
+DyGIE-- Standalone — Collate
 可変長テンソルをパディングしてバッチ化します。
 スパン数・トークン数がドキュメントごとに異なるため、
 各フィールドをゼロパディングして揃えます。

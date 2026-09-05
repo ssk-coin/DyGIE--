@@ -1,5 +1,5 @@
 """
-DyGIE++ Standalone — メインモデル
+DyGIE-- Standalone — メインモデル
 
 Transformer エンコーダ + スパン抽出 + NER / RE / Coref ヘッドを統合します。
 AllenNLP には一切依存しません。

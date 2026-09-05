@@ -1,5 +1,5 @@
 """
-DyGIE++ Standalone — NER Module
+DyGIE-- Standalone — NER Module
 
 スパン表現を受け取り、各スパンが Named Entity かどうかを分類する。
 ラベル 0 = "no entity"、1 以上が実エンティティラベル。
