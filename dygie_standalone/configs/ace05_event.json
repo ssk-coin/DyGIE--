@@ -51,6 +51,11 @@
   "use_distance_feature": false,
   "focal_loss_gamma": 0.0,
 
+  "_comment_seed": "=== 再現性オプション (v7) ===",
+
+  "seed": 42,
+  "_comment_seed_detail": "Python / NumPy / PyTorch の乱数シードを一括固定する。cuDNN も deterministic モードになる（速度より再現性を優先）。null または キーなし で固定しない。",
+
   "_comment_event": "=== イベント抽出 (ACE 2005) ===",
   "_comment_event_types": "自動収集されます。ACE 2005 のイベントタイプ例:",
   "_event_types_example": [

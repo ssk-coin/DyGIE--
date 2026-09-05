@@ -83,6 +83,11 @@
   "lora_target_modules": ["query", "value"],
   "_comment_lora_target_modules": "LoRA を適用する BERT のモジュール名。['query', 'value'] が標準。['query', 'key', 'value', 'dense'] まで広げると表現力が上がる。",
 
+  "_comment_seed": "=== 再現性オプション (v7) ===",
+
+  "seed": 42,
+  "_comment_seed_detail": "Python / NumPy / PyTorch の乱数シードを一括固定する。cuDNN も deterministic モードになる（速度より再現性を優先）。null または キーなし で固定しない。",
+
   "_comment_ner_labels": "自動収集されます。手動指定したい場合は下記のコメントを外してください。",
   "_ner_labels_example": ["Task", "Method", "Metric", "Material", "OtherScientificTerm", "Generic"],
   "_rel_labels_example": ["Used-for", "Feature-of", "Hyponym-of", "Part-of", "Compare", "Conjunction", "Evaluate-for", "Coref-of"]

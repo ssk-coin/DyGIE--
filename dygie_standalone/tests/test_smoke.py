@@ -862,6 +862,78 @@ def test_lora_save_load():
     )
 
 
+def test_seed_reproducibility():
+    """同じシードで 2 回 forward した結果が一致し、異なるシードでは変わることを確認する。"""
+    import random, os
+
+    def _set_seed(seed: int):
+        random.seed(seed)
+        os.environ["PYTHONHASHSEED"] = str(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        try:
+            import numpy as np
+            np.random.seed(seed)
+        except ImportError:
+            pass
+
+    ds = DyGIEDataset(SAMPLE, _TOK, max_span_width=4, max_total_length=128)
+    loader = DataLoader(ds, batch_size=2, collate_fn=collate_fn)
+    batch = next(iter(loader))
+    common_kwargs = dict(
+        transformer_model=MODEL_NAME,
+        ner_labels=ds.ner_labels,
+        rel_labels=ds.rel_labels,
+        max_span_width=4,
+        feedforward_dim=64,
+        width_embedding_dim=32,
+        dropout=0.0,
+    )
+
+    # --- 同じシードで 2 回実行 → 初期化後の forward 出力が一致 ---
+    _set_seed(42)
+    m1 = DyGIE(**common_kwargs)
+    _set_seed(42)
+    m2 = DyGIE(**common_kwargs)
+    m1.eval(); m2.eval()
+    with torch.no_grad():
+        o1 = m1(
+            input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
+            token_to_subword=batch["token_to_subword"],
+            spans=batch["spans"], span_mask=batch["span_mask"],
+            num_tokens=batch["num_tokens"], use_gold_spans=False,
+        )
+        o2 = m2(
+            input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
+            token_to_subword=batch["token_to_subword"],
+            spans=batch["spans"], span_mask=batch["span_mask"],
+            num_tokens=batch["num_tokens"], use_gold_spans=False,
+        )
+    assert torch.allclose(o1["ner_logits"], o2["ner_logits"]), \
+        "同じシードで初期化したモデルの ner_logits が一致しません"
+
+    # --- 異なるシードで初期化 → task head の初期値が変わるので logits も変わるはず ---
+    _set_seed(0)
+    m3 = DyGIE(**common_kwargs)
+    m3.eval()
+    with torch.no_grad():
+        o3 = m3(
+            input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
+            token_to_subword=batch["token_to_subword"],
+            spans=batch["spans"], span_mask=batch["span_mask"],
+            num_tokens=batch["num_tokens"], use_gold_spans=False,
+        )
+    same_seed_match = torch.allclose(o1["ner_logits"], o2["ner_logits"])
+    diff_seed_differs = not torch.allclose(o1["ner_logits"], o3["ner_logits"])
+    print(
+        f"  [OK] seed=42 再現性確認: "
+        f"o1≡o2={same_seed_match} | "
+        f"seed=42 vs seed=0 が異なる={diff_seed_differs}"
+    )
+
+
 if __name__ == "__main__":
     tests = [
         ("Dataset",                           test_dataset),
@@ -878,6 +950,7 @@ if __name__ == "__main__":
         ("Event Forward + Loss",              test_event_forward),
         ("LoRA forward/backward",             test_lora_forward),
         ("LoRA save / load pretrained",       test_lora_save_load),
+        ("Seed reproducibility",              test_seed_reproducibility),
     ]
     print("\n===== DyGIE++ Standalone Smoke Tests =====")
     passed = failed = 0

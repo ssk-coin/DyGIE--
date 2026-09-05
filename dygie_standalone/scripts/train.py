@@ -89,7 +89,28 @@ def parse_args() -> argparse.Namespace:
                    help="LoRA のスケーリング係数（デフォルト 32）")
     p.add_argument("--lora_dropout",      type=float, default=None,
                    help="LoRA アダプタ内の Dropout 率（デフォルト 0.1）")
+    # 再現性オプション (v7)
+    p.add_argument("--seed",              type=int,   default=None,
+                   help="乱数シード（Python / NumPy / PyTorch を一括固定）。未指定時は固定しない。")
     return p.parse_args()
+
+
+def _set_seed(seed: int) -> None:
+    """Python / NumPy / PyTorch の乱数シードを一括固定する。"""
+    import random
+    import os
+    random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    try:
+        import numpy as np
+        np.random.seed(seed)
+    except ImportError:
+        pass
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # cuDNN の決定論的動作を有効化（速度より再現性を優先）
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def main() -> None:
@@ -125,8 +146,17 @@ def main() -> None:
         val = getattr(args, key, None)
         if val is not None:
             cfg[key] = val
+    # 再現性オプション
+    if args.seed is not None:
+        cfg["seed"] = args.seed
 
     logger.info("Config: %s", json.dumps(cfg, indent=2, ensure_ascii=False))
+
+    # ---- 乱数シード固定 ----
+    seed = cfg.get("seed", None)
+    if seed is not None:
+        _set_seed(seed)
+        logger.info("乱数シードを %d に固定しました (Python / NumPy / PyTorch)", seed)
 
     # ---- Tokenizer ----
     tokenizer = AutoTokenizer.from_pretrained(cfg["transformer_model"])
