@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DyGIE++ Standalone — 評価スクリプト
+DyGIE-- — 評価スクリプト
 
 Gold と Prediction の jsonl を比較して NER / RE / Coref の F1 を計算します。
 
