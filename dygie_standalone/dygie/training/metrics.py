@@ -1,5 +1,5 @@
 """
-DyGIE++ Standalone — Metrics
+DyGIE-- — Metrics
 
 NER: span-level micro F1（ラベル込み）
 RE : span-pair-level micro F1（ラベル込み）
