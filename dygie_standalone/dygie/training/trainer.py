@@ -19,6 +19,15 @@ AllenNLP の Trainer を置き換える純粋な PyTorch 学習ループ。
 
 改善点 (v8):
   - early_stopping_metric: early stopping の判定に使うメトリクスを設定可能
+
+バグ修正 (v9):
+  - _evaluate() の RE / Event 引数メトリクスを end-to-end 評価に統一。
+    従来は model が出力した pair_mask（予測エンティティペアのみ）を使用していたため、
+    エンティティを見逃したペアの gold 関係が FN にカウントされず、
+    trainer の RE F1 が evaluate.py の値より高く表示される問題があった。
+    修正後は全有効スパンペアを対象とした full_pair_mask を使用し、
+    予測エンティティ外の gold 関係も FN として正しくカウントする。
+    これにより trainer の評価スコアが evaluate.py と一致するようになった。
 """
 
 from __future__ import annotations
@@ -376,10 +385,19 @@ class Trainer:
                 )
 
             if self.model.use_rel and "rel_preds" in outputs:
+                # end-to-end RE 評価: 予測エンティティペアだけでなく
+                # 全有効スパンペアを対象とする（evaluate.py との整合）。
+                # rel_preds は非エンティティペアについて 0 が格納済みなので、
+                # full_pair_mask を使うと missed entity による gold 関係も FN に計上される。
+                sm = batch["span_mask"].cpu()
+                K_size = sm.size(1)
+                full_pair_mask = sm.unsqueeze(2) & sm.unsqueeze(1)   # [B, K, K]
+                eye = torch.eye(K_size, dtype=torch.bool).unsqueeze(0)
+                full_pair_mask = full_pair_mask & ~eye                # 自己ループ除外
                 self.rel_metrics.update(
                     preds=outputs["rel_preds"].cpu(),
                     golds=batch["rel_labels"].cpu(),
-                    pair_mask=outputs["pair_mask"].cpu(),
+                    pair_mask=full_pair_mask,
                 )
 
             if self.model.use_coref and "top_span_indices" in outputs:
@@ -396,13 +414,19 @@ class Trainer:
                     )
 
             if self.model.use_event and "event_trigger_preds" in outputs:
+                # end-to-end Event 引数評価: 予測トリガーペアだけでなく
+                # 全有効スパンペアを対象とする（evaluate.py との整合）。
+                # event_arg_preds は非トリガースパンについて 0 が格納済みなので、
+                # full_pair_mask を使うと missed trigger による gold 引数も FN に計上される。
+                sm = batch["span_mask"].cpu()
+                full_arg_mask = sm.unsqueeze(2) & sm.unsqueeze(1)    # [B, K, K]
                 self.event_metrics.update(
                     trigger_preds=outputs["event_trigger_preds"].cpu(),
                     trigger_golds=batch["event_trigger_labels"].cpu(),
                     arg_preds=outputs["event_arg_preds"].cpu(),
                     arg_golds=batch["event_arg_labels"].cpu(),
-                    span_mask=batch["span_mask"].cpu(),
-                    arg_mask=outputs["event_arg_mask"].cpu(),
+                    span_mask=sm,
+                    arg_mask=full_arg_mask,
                 )
 
         metrics: dict[str, float] = {}
