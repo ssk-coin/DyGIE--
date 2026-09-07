@@ -115,6 +115,12 @@ class DyGIE(nn.Module):
     lora_target_modules : list[str] | None
         LoRA を適用する BERT のモジュール名。
         None のとき BERT/SciBERT デフォルト ["query", "value"] を使用。
+    coref_prop : int
+        スパングラフ伝播（DyGIE++ Section 3.3）の反復回数。
+        0 のとき伝播なし（SpanPropagation モジュールを生成しない）。
+        1 以上のとき coref antecedent scores を辺として GRU スタイルで
+        span_repr を coref_prop 回繰り返し更新する。
+        元論文の設定: 1。use_coref=False のときは無視される。
     """
 
     def __init__(
@@ -152,6 +158,8 @@ class DyGIE(nn.Module):
         lora_alpha: int = 32,
         lora_dropout: float = 0.1,
         lora_target_modules: list[str] | None = None,
+        # スパングラフ伝播 (v10)
+        coref_prop: int = 1,
     ) -> None:
         super().__init__()
 
@@ -159,6 +167,7 @@ class DyGIE(nn.Module):
         self.use_rel = use_rel
         self.use_coref = use_coref
         self.use_event = use_event
+        self.coref_prop = coref_prop
         self.ner_loss_weight = ner_loss_weight
         self.rel_loss_weight = rel_loss_weight
         self.coref_loss_weight = coref_loss_weight
@@ -204,6 +213,8 @@ class DyGIE(nn.Module):
             "lora_alpha": lora_alpha,
             "lora_dropout": lora_dropout,
             "lora_target_modules": lora_target_modules or ["query", "value"],
+            # v10: スパングラフ伝播
+            "coref_prop": coref_prop,
         }
 
         # ---- Transformer encoder ----
@@ -291,9 +302,13 @@ class DyGIE(nn.Module):
                 max_top_antecedents=max_top_antecedents,
                 dropout=dropout,
             )
-            # スパングラフ伝播: Coref クラスタを辺として NER/RE 前に span_repr を更新
+            # スパングラフ伝播: coref_prop > 0 のときのみ有効
             # (DyGIE++ 論文 Section 3.3 / Wadden et al., 2019)
-            self.span_prop = SpanPropagation(span_dim=span_dim, dropout=dropout)
+            # coref_prop は伝播の反復回数。0 で無効、1 以上で coref_prop 回繰り返す。
+            if coref_prop > 0:
+                self.span_prop = SpanPropagation(span_dim=span_dim, dropout=dropout)
+            else:
+                self.span_prop = None  # type: ignore
         else:
             self.coref_module = None  # type: ignore
             self.span_prop = None  # type: ignore
@@ -418,15 +433,18 @@ class DyGIE(nn.Module):
             output["antecedent_scores"] = coref_repr["antecedent_scores"]
 
         # ---- Phase 2: Span Graph Propagation (Section 3.3) ----
-        # Coref antecedent scores を辺として GRU スタイルでスパン表現を更新する。
+        # coref_prop > 0 のとき、coref antecedent scores を辺として GRU スタイルで
+        # スパン表現を coref_prop 回繰り返し更新する。
         # 同一エンティティの複数スパン間で情報を共有し、NER・RE の精度を向上させる。
-        if self.span_prop is not None and coref_repr is not None:
-            span_repr = self.span_prop(
-                span_repr=span_repr,
-                top_span_indices=coref_repr["top_span_indices"],
-                top_span_mask=coref_repr["top_span_mask"],
-                antecedent_scores=coref_repr["antecedent_scores"],
-            )
+        # coref_prop == 0 のとき伝播なし（元の DyGIE++ の "no propagation" 設定に相当）。
+        if self.coref_prop > 0 and self.span_prop is not None and coref_repr is not None:
+            for _ in range(self.coref_prop):
+                span_repr = self.span_prop(
+                    span_repr=span_repr,
+                    top_span_indices=coref_repr["top_span_indices"],
+                    top_span_mask=coref_repr["top_span_mask"],
+                    antecedent_scores=coref_repr["antecedent_scores"],
+                )
 
         # ---- Phase 3: NER (伝播後の span_repr を使用) ----
         if self.ner_module is not None:
