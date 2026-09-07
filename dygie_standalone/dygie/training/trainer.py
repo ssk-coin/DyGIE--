@@ -28,6 +28,16 @@ AllenNLP の Trainer を置き換える純粋な PyTorch 学習ループ。
     修正後は全有効スパンペアを対象とした full_pair_mask を使用し、
     予測エンティティ外の gold 関係も FN として正しくカウントする。
     これにより trainer の評価スコアが evaluate.py と一致するようになった。
+
+バグ修正 (v12):
+  - max_span_width によって除外された gold アノテーションが FN にカウントされない問題を修正。
+    max_span_width=1 などの小さい値で学習した場合、gold NER/RE/Event アノテーションのうち
+    スパン幅が max_span_width を超えるものは span_index に存在しないため、
+    label テンソルに格納されず（ゼロ埋め）、FN としてカウントされなかった。
+    これにより recall が人為的に高く表示される問題があった。
+    修正後は dataset.py で除外された gold 数をカウントし、
+    collate_fn でバッチ合計し、metrics.update() の extra_fn に渡して
+    FN として正しくカウントする。
 """
 
 from __future__ import annotations
@@ -382,6 +392,8 @@ class Trainer:
                     preds=outputs["ner_preds"].cpu(),
                     golds=batch["ner_labels"].cpu(),
                     span_mask=batch["span_mask"].cpu(),
+                    # max_span_width で除外された gold エンティティを FN に追加
+                    extra_fn=batch.get("ner_excluded_gold_count", 0),
                 )
 
             if self.model.use_rel and "rel_preds" in outputs:
@@ -398,6 +410,8 @@ class Trainer:
                     preds=outputs["rel_preds"].cpu(),
                     golds=batch["rel_labels"].cpu(),
                     pair_mask=full_pair_mask,
+                    # max_span_width で除外された gold 関係を FN に追加
+                    extra_fn=batch.get("rel_excluded_gold_count", 0),
                 )
 
             if self.model.use_coref and "top_span_indices" in outputs:
@@ -427,6 +441,9 @@ class Trainer:
                     arg_golds=batch["event_arg_labels"].cpu(),
                     span_mask=sm,
                     arg_mask=full_arg_mask,
+                    # max_span_width で除外された gold イベントを FN に追加
+                    extra_trigger_fn=batch.get("event_trigger_excluded_gold_count", 0),
+                    extra_arg_fn=batch.get("event_arg_excluded_gold_count", 0),
                 )
 
         metrics: dict[str, float] = {}

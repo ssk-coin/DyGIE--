@@ -76,6 +76,12 @@ def collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
     sentence_offsets = [s["sentence_offsets"] for s in batch]
     coref_clusters = [s["coref_clusters"] for s in batch]
 
+    # 除外された gold アノテーション数をバッチ内で合算する（int スカラー）。
+    ner_excluded_gold = sum(s.get("ner_excluded_gold_count", 0) for s in batch)
+    rel_excluded_gold = sum(s.get("rel_excluded_gold_count", 0) for s in batch)
+    event_trigger_excluded_gold = sum(s.get("event_trigger_excluded_gold_count", 0) for s in batch)
+    event_arg_excluded_gold = sum(s.get("event_arg_excluded_gold_count", 0) for s in batch)
+
     return {
         "doc_keys": doc_keys,
         "input_ids": input_ids,
@@ -91,4 +97,8 @@ def collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "event_trigger_labels": event_trigger_labels,
         "event_arg_labels": event_arg_labels,
         "num_tokens": num_tokens,
+        "ner_excluded_gold_count": ner_excluded_gold,
+        "rel_excluded_gold_count": rel_excluded_gold,
+        "event_trigger_excluded_gold_count": event_trigger_excluded_gold,
+        "event_arg_excluded_gold_count": event_arg_excluded_gold,
     }
