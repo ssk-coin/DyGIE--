@@ -6,6 +6,8 @@
   "use_ner":   true,
   "use_rel":   true,
   "use_coref": true,
+  "coref_prop": 1,
+  "_comment_coref_prop": "スパングラフ伝播の反復回数（DyGIE++ Section 3.3）。0 で無効、1 以上で coref_prop 回繰り返す。元論文の設定: 1。use_coref=false のときは無視される。",
 
   "ner_loss_weight":   1.0,
   "rel_loss_weight":   1.0,

@@ -248,6 +248,8 @@ def main() -> None:
         lora_alpha=cfg.get("lora_alpha", 32),
         lora_dropout=cfg.get("lora_dropout", 0.1),
         lora_target_modules=cfg.get("lora_target_modules", None),
+        # v10: スパングラフ伝播
+        coref_prop=cfg.get("coref_prop", 1),
     )
 
     # ---- Trainer ----

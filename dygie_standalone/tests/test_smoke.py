@@ -1066,6 +1066,81 @@ def test_re_eval_consistency():
     )
 
 
+def test_coref_prop():
+    """
+    coref_prop パラメータの動作確認テスト (v10)。
+
+    - coref_prop=0 のとき SpanPropagation モジュールが生成されない
+    - coref_prop=1 (デフォルト) のとき SpanPropagation が生成される
+    - coref_prop=2 のとき SpanPropagation が生成され、2 回伝播が実行できる
+    - forward が各設定で正常に動作する
+    - _init_config に coref_prop が保存される
+    """
+    from dygie.data import DyGIEDataset
+    from dygie.model.span_propagation import SpanPropagation
+
+    tok = _TOK
+    ds = DyGIEDataset(SAMPLE, tok, max_span_width=4, max_total_length=128)
+
+    base_kwargs = dict(
+        transformer_model=MODEL_NAME,
+        ner_labels=ds.ner_labels,
+        rel_labels=ds.rel_labels,
+        max_span_width=4,
+        use_ner=True,
+        use_rel=True,
+        use_coref=True,
+        feedforward_dim=64,
+        width_embedding_dim=32,
+        use_attentive_pooling=True,
+        spans_per_word=0.4,
+        dropout=0.0,
+    )
+
+    # coref_prop=0: span_prop が生成されないことを確認
+    m0 = DyGIE(**base_kwargs, coref_prop=0)
+    assert m0.coref_prop == 0, f"coref_prop != 0: {m0.coref_prop}"
+    assert m0.span_prop is None, "coref_prop=0 のとき span_prop は None であるべき"
+    assert m0._init_config["coref_prop"] == 0
+
+    # coref_prop=1 (デフォルト)
+    m1 = DyGIE(**base_kwargs, coref_prop=1)
+    assert m1.coref_prop == 1
+    assert isinstance(m1.span_prop, SpanPropagation), \
+        "coref_prop=1 のとき span_prop は SpanPropagation であるべき"
+    assert m1._init_config["coref_prop"] == 1
+
+    # coref_prop=2
+    m2 = DyGIE(**base_kwargs, coref_prop=2)
+    assert m2.coref_prop == 2
+    assert isinstance(m2.span_prop, SpanPropagation)
+    assert m2._init_config["coref_prop"] == 2
+
+    # forward が各設定で正常に動作することを確認
+    dl = DataLoader(ds, batch_size=2, collate_fn=collate_fn)
+    batch = next(iter(dl))
+    for model, label in [(m0, "coref_prop=0"), (m1, "coref_prop=1"), (m2, "coref_prop=2")]:
+        model.eval()
+        with torch.no_grad():
+            out = model(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                token_to_subword=batch["token_to_subword"],
+                spans=batch["spans"],
+                span_mask=batch["span_mask"],
+                num_tokens=batch["num_tokens"],
+                ner_labels=batch["ner_labels"],
+                rel_labels=batch["rel_labels"],
+                coref_clusters=batch.get("coref_clusters"),
+            )
+        assert "ner_preds" in out, f"{label}: ner_preds が出力に含まれない"
+        assert "rel_preds" in out, f"{label}: rel_preds が出力に含まれない"
+
+    print(
+        "  [OK] coref_prop: 0=span_prop省略, 1=SpanProp×1, 2=SpanProp×2 が正常動作"
+    )
+
+
 if __name__ == "__main__":
     tests = [
         ("Dataset",                           test_dataset),
@@ -1085,6 +1160,7 @@ if __name__ == "__main__":
         ("Early stopping metric selection",   test_early_stopping_metric),
         ("Seed reproducibility",              test_seed_reproducibility),
         ("RE eval end-to-end consistency",    test_re_eval_consistency),
+        ("coref_prop parameter",              test_coref_prop),
     ]
     print("\n===== DyGIE++ Standalone Smoke Tests =====")
     passed = failed = 0

@@ -6,6 +6,7 @@
   "use_ner":   true,
   "use_rel":   false,
   "use_coref": false,
+  "coref_prop": 1,
   "use_event": true,
 
   "ner_loss_weight":   1.0,
