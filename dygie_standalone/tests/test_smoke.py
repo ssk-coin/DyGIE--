@@ -1068,16 +1068,19 @@ def test_re_eval_consistency():
 
 def test_coref_prop():
     """
-    coref_prop パラメータの動作確認テスト (v10)。
+    coref_prop パラメータの動作確認テスト (v10/v11)。
 
     - coref_prop=0 のとき SpanPropagation モジュールが生成されない
     - coref_prop=1 (デフォルト) のとき SpanPropagation が生成される
-    - coref_prop=2 のとき SpanPropagation が生成され、2 回伝播が実行できる
+    - coref_prop=2 のとき 2 回伝播が実行できる
+    - use_coref=False かつ coref_prop>0 でも伝播が動作する（元の DyGIE++ と同じ動作）
+    - use_coref=False かつ coref_prop>0 では coref 損失が計算されない
     - forward が各設定で正常に動作する
     - _init_config に coref_prop が保存される
     """
     from dygie.data import DyGIEDataset
     from dygie.model.span_propagation import SpanPropagation
+    from dygie.model.coref_module import CorefModule
 
     tok = _TOK
     ds = DyGIEDataset(SAMPLE, tok, max_span_width=4, max_total_length=128)
@@ -1089,7 +1092,6 @@ def test_coref_prop():
         max_span_width=4,
         use_ner=True,
         use_rel=True,
-        use_coref=True,
         feedforward_dim=64,
         width_embedding_dim=32,
         use_attentive_pooling=True,
@@ -1097,29 +1099,41 @@ def test_coref_prop():
         dropout=0.0,
     )
 
-    # coref_prop=0: span_prop が生成されないことを確認
-    m0 = DyGIE(**base_kwargs, coref_prop=0)
-    assert m0.coref_prop == 0, f"coref_prop != 0: {m0.coref_prop}"
-    assert m0.span_prop is None, "coref_prop=0 のとき span_prop は None であるべき"
+    # coref_prop=0, use_coref=False: coref_module も span_prop も生成されない
+    m_none = DyGIE(**base_kwargs, use_coref=False, coref_prop=0)
+    assert m_none.coref_module is None, "use_coref=False, coref_prop=0 → coref_module は None"
+    assert m_none.span_prop is None
+
+    # coref_prop=0, use_coref=True: coref_module のみ生成、span_prop なし
+    m0 = DyGIE(**base_kwargs, use_coref=True, coref_prop=0)
+    assert isinstance(m0.coref_module, CorefModule), "use_coref=True → coref_module が必要"
+    assert m0.span_prop is None, "coref_prop=0 → span_prop は None"
     assert m0._init_config["coref_prop"] == 0
 
-    # coref_prop=1 (デフォルト)
-    m1 = DyGIE(**base_kwargs, coref_prop=1)
-    assert m1.coref_prop == 1
-    assert isinstance(m1.span_prop, SpanPropagation), \
-        "coref_prop=1 のとき span_prop は SpanPropagation であるべき"
+    # coref_prop=1, use_coref=True (デフォルト): 両方生成
+    m1 = DyGIE(**base_kwargs, use_coref=True, coref_prop=1)
+    assert isinstance(m1.coref_module, CorefModule)
+    assert isinstance(m1.span_prop, SpanPropagation)
     assert m1._init_config["coref_prop"] == 1
 
-    # coref_prop=2
-    m2 = DyGIE(**base_kwargs, coref_prop=2)
-    assert m2.coref_prop == 2
-    assert isinstance(m2.span_prop, SpanPropagation)
-    assert m2._init_config["coref_prop"] == 2
+    # coref_prop=1, use_coref=False: coref_module (伝播用) と span_prop が生成される
+    # （元の DyGIE++ と同じ: coref_prop > 0 なら coref タスク無効でも伝播可能）
+    m_prop_no_coref = DyGIE(**base_kwargs, use_coref=False, coref_prop=1)
+    assert isinstance(m_prop_no_coref.coref_module, CorefModule), \
+        "coref_prop=1, use_coref=False でも coref_module (伝播用) が必要"
+    assert isinstance(m_prop_no_coref.span_prop, SpanPropagation), \
+        "coref_prop=1, use_coref=False でも span_prop が生成されるべき"
 
     # forward が各設定で正常に動作することを確認
     dl = DataLoader(ds, batch_size=2, collate_fn=collate_fn)
     batch = next(iter(dl))
-    for model, label in [(m0, "coref_prop=0"), (m1, "coref_prop=1"), (m2, "coref_prop=2")]:
+    cases = [
+        (m_none,          "use_coref=False, coref_prop=0", False),
+        (m0,              "use_coref=True,  coref_prop=0", True),
+        (m1,              "use_coref=True,  coref_prop=1", True),
+        (m_prop_no_coref, "use_coref=False, coref_prop=1", False),
+    ]
+    for model, label, expect_coref_loss in cases:
         model.eval()
         with torch.no_grad():
             out = model(
@@ -1135,9 +1149,16 @@ def test_coref_prop():
             )
         assert "ner_preds" in out, f"{label}: ner_preds が出力に含まれない"
         assert "rel_preds" in out, f"{label}: rel_preds が出力に含まれない"
+        if expect_coref_loss:
+            assert "coref_loss" in out, f"{label}: coref_loss が出力に含まれるべき"
+            assert "antecedent_scores" in out
+        else:
+            assert "coref_loss" not in out, f"{label}: coref_loss は出力されないべき"
+            if not model.use_coref:
+                assert "antecedent_scores" not in out
 
     print(
-        "  [OK] coref_prop: 0=span_prop省略, 1=SpanProp×1, 2=SpanProp×2 が正常動作"
+        "  [OK] coref_prop: use_coref と coref_prop が独立して動作（元の DyGIE++ と同じ）"
     )
 
 

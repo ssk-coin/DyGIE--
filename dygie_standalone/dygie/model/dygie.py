@@ -294,7 +294,10 @@ class DyGIE(nn.Module):
         else:
             self.rel_module = None  # type: ignore
 
-        if use_coref:
+        # CorefModule は use_coref=True（coref タスク）または coref_prop > 0（伝播のみ使用）
+        # のどちらかで生成する。伝播には antecedent scores が必要なため。
+        # use_coref=False かつ coref_prop=0 のときのみ生成しない。
+        if use_coref or coref_prop > 0:
             self.coref_module = CorefModule(
                 span_dim=span_dim,
                 feedforward_dim=feedforward_dim,
@@ -302,15 +305,15 @@ class DyGIE(nn.Module):
                 max_top_antecedents=max_top_antecedents,
                 dropout=dropout,
             )
-            # スパングラフ伝播: coref_prop > 0 のときのみ有効
-            # (DyGIE++ 論文 Section 3.3 / Wadden et al., 2019)
-            # coref_prop は伝播の反復回数。0 で無効、1 以上で coref_prop 回繰り返す。
-            if coref_prop > 0:
-                self.span_prop = SpanPropagation(span_dim=span_dim, dropout=dropout)
-            else:
-                self.span_prop = None  # type: ignore
         else:
             self.coref_module = None  # type: ignore
+
+        # スパングラフ伝播: coref_prop > 0 のときのみ有効（use_coref とは独立）
+        # (DyGIE++ 論文 Section 3.3 / Wadden et al., 2019)
+        # coref_prop は伝播の反復回数。0 で無効、1 以上で coref_prop 回繰り返す。
+        if coref_prop > 0:
+            self.span_prop = SpanPropagation(span_dim=span_dim, dropout=dropout)
+        else:
             self.span_prop = None  # type: ignore
 
         # ---- イベント抽出ヘッド ----
@@ -418,6 +421,8 @@ class DyGIE(nn.Module):
         # ====================================================================
 
         # ---- Phase 1: Coref compute_representations ----
+        # use_coref=True（coref タスク）または coref_prop > 0（伝播のみ）のとき実行する。
+        # antecedent_scores は Phase 2 の SpanPropagation でも使用する。
         coref_repr: dict[str, Any] | None = None
         if self.coref_module is not None:
             coref_repr = self.coref_module.compute_representations(
@@ -426,11 +431,12 @@ class DyGIE(nn.Module):
                 spans=spans,
                 num_tokens=num_tokens,
             )
-            # antecedent_scores は SpanProp と出力に使用（損失はまだ計算しない）
-            output["mention_scores"]    = coref_repr["mention_scores"]
-            output["top_span_indices"]  = coref_repr["top_span_indices"]
-            output["top_span_mask"]     = coref_repr["top_span_mask"]
-            output["antecedent_scores"] = coref_repr["antecedent_scores"]
+            # mention_scores / antecedent_scores は coref タスクが有効なときのみ出力する
+            if self.use_coref:
+                output["mention_scores"]    = coref_repr["mention_scores"]
+                output["top_span_indices"]  = coref_repr["top_span_indices"]
+                output["top_span_mask"]     = coref_repr["top_span_mask"]
+                output["antecedent_scores"] = coref_repr["antecedent_scores"]
 
         # ---- Phase 2: Span Graph Propagation (Section 3.3) ----
         # coref_prop > 0 のとき、coref antecedent scores を辺として GRU スタイルで
@@ -463,7 +469,9 @@ class DyGIE(nn.Module):
 
         # ---- Phase 4: coref.predict_labels (NER の後・RE の前) ----
         # 原論文の順序に従い、クラスタ割り当てと coref 損失計算を NER の後に実行する。
-        if self.coref_module is not None and coref_repr is not None:
+        # use_coref=False かつ coref_prop > 0 の場合は coref_module が伝播用に
+        # 存在するが、損失は計算しない（タスクとして有効でないため）。
+        if self.use_coref and self.coref_module is not None and coref_repr is not None:
             coref_repr = self.coref_module.predict_labels(
                 coref_repr=coref_repr,
                 spans=spans,
