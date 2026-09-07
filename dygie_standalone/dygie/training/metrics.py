@@ -51,6 +51,7 @@ class NERMetrics:
         golds: torch.Tensor,    # [B, K]
         span_mask: torch.Tensor,  # [B, K]
         spans: torch.Tensor | None = None,  # [B, K, 2] (未使用、API 統一のため)
+        extra_fn: int = 0,      # max_span_width などで除外された gold エンティティ数
     ) -> None:
         B, K = preds.shape
         for b in range(B):
@@ -73,6 +74,8 @@ class NERMetrics:
                 elif p > 0 and g == 0:
                     self.fp += 1
                     self.fp_per_label[p] += 1
+        # スパン幅制限などで span_index に含まれなかった gold エンティティを FN に追加
+        self.fn += extra_fn
 
     def compute(self) -> dict[str, float]:
         p = self.tp / (self.tp + self.fp + 1e-9)
@@ -101,6 +104,7 @@ class RelationMetrics:
         preds: torch.Tensor,      # [B, K, K]
         golds: torch.Tensor,      # [B, K, K]
         pair_mask: torch.Tensor,  # [B, K, K]
+        extra_fn: int = 0,        # max_span_width などで除外された gold 関係数
     ) -> None:
         for b in range(preds.size(0)):
             mask = pair_mask[b]
@@ -117,6 +121,8 @@ class RelationMetrics:
                     self.fn += 1
                 elif p > 0 and g == 0:
                     self.fp += 1
+        # スパン幅制限などで span_index に含まれなかった gold 関係を FN に追加
+        self.fn += extra_fn
 
     def compute(self) -> dict[str, float]:
         p = self.tp / (self.tp + self.fp + 1e-9)
@@ -164,6 +170,8 @@ class EventMetrics:
         arg_golds: torch.Tensor,        # [B, K, K]
         span_mask: torch.Tensor,        # [B, K]
         arg_mask: torch.Tensor,         # [B, K, K]  有効 (trigger, arg) ペア
+        extra_trigger_fn: int = 0,      # max_span_width などで除外された gold トリガー数
+        extra_arg_fn: int = 0,          # max_span_width などで除外された gold 引数数
     ) -> None:
         B = trigger_preds.size(0)
         for b in range(B):
@@ -197,6 +205,9 @@ class EventMetrics:
                     self.arg_fn += 1
                 elif p > 0 and g == 0:
                     self.arg_fp += 1
+        # スパン幅制限などで除外された gold アノテーションを FN に追加
+        self.trig_fn += extra_trigger_fn
+        self.arg_fn += extra_arg_fn
 
     def compute(self) -> dict[str, float]:
         def _prf(tp: int, fp: int, fn: int) -> tuple[float, float, float]:

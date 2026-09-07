@@ -1162,6 +1162,70 @@ def test_coref_prop():
     )
 
 
+def test_excluded_gold_count() -> None:
+    """v12: max_span_width で除外された gold アノテーションが FN にカウントされることを確認する。
+
+    max_span_width=1 では幅 1 のスパンしか span_index に含まれない。
+    サンプルデータに幅 > 1 の gold NER/RE エンティティがあれば、
+    それらが ner_excluded_gold_count > 0 として返される。
+    また、NERMetrics.update(extra_fn=N) を呼ぶと fn が N だけ増加する。
+    """
+    from dygie.training.metrics import NERMetrics, RelationMetrics
+
+    # --- NERMetrics の extra_fn 動作を確認 ---
+    m = NERMetrics()
+    # TP=1, FN=1（通常の span_mask の範囲内）
+    preds = torch.tensor([[1, 0]])  # [B=1, K=2]
+    golds = torch.tensor([[1, 1]])
+    mask  = torch.tensor([[True, True]])
+    m.update(preds, golds, mask)
+    assert m.tp == 1 and m.fn == 1, f"基準: tp={m.tp}, fn={m.fn}"
+
+    # extra_fn=3 を追加すると fn が 3 増える
+    m.update(preds, golds, mask, extra_fn=3)
+    assert m.fn == 1 + 1 + 3, f"extra_fn 後: fn={m.fn} (期待 5)"
+
+    res = m.compute()
+    # tp=2, fn=5, fp=0  → recall = 2/(2+5) ≈ 0.286
+    expected_r = 2 / (2 + 5 + 1e-9)
+    assert abs(res["ner_recall"] - expected_r) < 1e-4, f"recall={res['ner_recall']}"
+
+    # --- RelationMetrics の extra_fn 動作を確認 ---
+    rm = RelationMetrics()
+    rpreds = torch.tensor([[[1, 0], [0, 0]]])   # [B=1, K=2, K=2]
+    rgolds = torch.tensor([[[1, 1], [0, 0]]])
+    rpair  = torch.tensor([[[True, True], [True, False]]])
+    rm.update(rpreds, rgolds, rpair, extra_fn=2)
+    # pair (0,0): g=1,p=1 → tp; pair (0,1): g=1,p=0 → fn; extra_fn=2 → fn=3
+    assert rm.tp == 1 and rm.fn == 3, f"RE: tp={rm.tp}, fn={rm.fn}"
+
+    # --- collate_fn が excluded_gold_count をバッチ合算するか確認 ---
+    # max_span_width=1 でデータセットを作成し、wide span が除外されるか確認
+    tok = _TOK
+    ds_narrow = DyGIEDataset(SAMPLE, tok, max_span_width=1, max_total_length=128)
+    ds_wide   = DyGIEDataset(SAMPLE, tok, max_span_width=8, max_total_length=128)
+
+    loader_narrow = DataLoader(ds_narrow, batch_size=2, collate_fn=collate_fn)
+    loader_wide   = DataLoader(ds_wide,   batch_size=2, collate_fn=collate_fn)
+
+    total_excluded_narrow = 0
+    total_excluded_wide   = 0
+    for batch in loader_narrow:
+        total_excluded_narrow += batch.get("ner_excluded_gold_count", 0)
+    for batch in loader_wide:
+        total_excluded_wide += batch.get("ner_excluded_gold_count", 0)
+
+    # サンプルデータに幅>1 の gold NER がある場合、narrow では除外数が wide より多い
+    assert total_excluded_narrow >= total_excluded_wide, (
+        f"narrow({total_excluded_narrow}) >= wide({total_excluded_wide}) であるべき"
+    )
+
+    print(
+        f"  [OK] excluded_gold_count: narrow={total_excluded_narrow}, wide={total_excluded_wide}"
+    )
+    print("  [OK] NERMetrics / RelationMetrics の extra_fn が正しく FN に追加される")
+
+
 if __name__ == "__main__":
     tests = [
         ("Dataset",                           test_dataset),
@@ -1182,6 +1246,7 @@ if __name__ == "__main__":
         ("Seed reproducibility",              test_seed_reproducibility),
         ("RE eval end-to-end consistency",    test_re_eval_consistency),
         ("coref_prop parameter",              test_coref_prop),
+        ("excluded gold count (v12)",         test_excluded_gold_count),
     ]
     print("\n===== DyGIE++ Standalone Smoke Tests =====")
     passed = failed = 0
