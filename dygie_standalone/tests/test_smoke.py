@@ -1007,6 +1007,65 @@ def test_seed_reproducibility():
     )
 
 
+def test_re_eval_consistency():
+    """
+    RE 評価の end-to-end 整合性テスト (v9 バグ修正)。
+
+    エンティティが見逃されたとき:
+    - 旧コード (pair_mask = 予測エンティティペアのみ):
+      見逃しエンティティに関連する gold 関係が FN にカウントされず、RE F1 が過大評価される。
+    - 新コード (full_pair_mask = 全有効スパンペア):
+      見逃しエンティティに関連する gold 関係も FN に正しくカウントされ、evaluate.py と一致する。
+    """
+    from dygie.training.metrics import RelationMetrics
+
+    # シナリオ: K=3 スパン (span_0, span_1, span_2)
+    # Gold: (span_0, span_1) に関係ラベル 1
+    # Pred: span_0 が NER に見逃され, preds はすべて 0 (関係なし)
+    # 旧コード pair_mask: span_1, span_2 だけが予測エンティティ → (span_0,span_1) は評価外
+    # 新コード full_pair_mask: 全有効スパンペアを対象 → (span_0,span_1) が FN に計上
+
+    B, K = 1, 3
+    golds = torch.zeros(B, K, K, dtype=torch.long)
+    golds[0, 0, 1] = 1  # gold: (span_0, span_1) → rel=1
+
+    preds = torch.zeros(B, K, K, dtype=torch.long)  # 全ペアで予測なし
+
+    # --- 旧コード: pair_mask = 予測エンティティペアのみ (span_0 を見逃した) ---
+    old_pair_mask = torch.zeros(B, K, K, dtype=torch.bool)
+    old_pair_mask[0, 1, 2] = True  # span_1↔span_2 だけ評価
+    old_pair_mask[0, 2, 1] = True
+    metrics_old = RelationMetrics()
+    metrics_old.update(preds=preds, golds=golds, pair_mask=old_pair_mask)
+    r_old = metrics_old.compute()
+    # gold (span_0, span_1) が pair_mask に含まれないため FN にカウントされない
+    assert metrics_old.fn == 0, (
+        f"[旧コード] pair_mask 使用時: FN は 0 になるはず (過大評価バグ), got {metrics_old.fn}"
+    )
+
+    # --- 新コード: full_pair_mask = 全有効スパンペア ---
+    span_mask = torch.tensor([[True, True, True]])  # [B, K]
+    full_pair_mask = span_mask.unsqueeze(2) & span_mask.unsqueeze(1)  # [B, K, K]
+    eye = torch.eye(K, dtype=torch.bool).unsqueeze(0)
+    full_pair_mask = full_pair_mask & ~eye  # 自己ループ除外
+    metrics_new = RelationMetrics()
+    metrics_new.update(preds=preds, golds=golds, pair_mask=full_pair_mask)
+    r_new = metrics_new.compute()
+    # gold (span_0, span_1) が FN に正しく計上される
+    assert metrics_new.fn == 1, (
+        f"[新コード] full_pair_mask 使用時: FN は 1 になるはず (correct), got {metrics_new.fn}"
+    )
+    assert r_new["rel_f1"] < 0.01, (
+        f"[新コード] RE F1 は 0.0 に近いはず, got {r_new['rel_f1']:.4f}"
+    )
+
+    print(
+        f"  [OK] RE eval end-to-end consistency (v9): "
+        f"旧 pair_mask → FN={metrics_old.fn} F1={r_old['rel_f1']:.4f} (過大評価) | "
+        f"新 full_pair_mask → FN={metrics_new.fn} F1={r_new['rel_f1']:.4f} (正確)"
+    )
+
+
 if __name__ == "__main__":
     tests = [
         ("Dataset",                           test_dataset),
@@ -1025,6 +1084,7 @@ if __name__ == "__main__":
         ("LoRA save / load pretrained",       test_lora_save_load),
         ("Early stopping metric selection",   test_early_stopping_metric),
         ("Seed reproducibility",              test_seed_reproducibility),
+        ("RE eval end-to-end consistency",    test_re_eval_consistency),
     ]
     print("\n===== DyGIE++ Standalone Smoke Tests =====")
     passed = failed = 0
