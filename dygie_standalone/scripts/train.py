@@ -19,8 +19,14 @@ import sys
 from pathlib import Path
 
 import torch
+import torch.multiprocessing as mp
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
+
+# num_workers > 0 のとき、Linux のデフォルト共有戦略 (file_descriptor) は
+# ファイルディスクリプタを大量消費して "Too many open files" を引き起こす。
+# file_system 戦略は tmpfs 上の一時ファイルで共有するため fd を消費しない。
+mp.set_sharing_strategy("file_system")
 
 # プロジェクトルートを sys.path に追加
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -205,19 +211,25 @@ def main() -> None:
     )
 
     batch_size = cfg.get("batch_size", 4)
+    num_workers = cfg.get("num_workers", 0)
+    # persistent_workers=True はワーカーをエポック間で使い回す（起動コスト削減）。
+    # num_workers=0 のときは無効にしないと DataLoader が警告を出す。
+    persistent_workers = num_workers > 0
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
         shuffle=True,
         collate_fn=collate_fn,
-        num_workers=cfg.get("num_workers", 0),
+        num_workers=num_workers,
+        persistent_workers=persistent_workers,
     )
     dev_loader = DataLoader(
         dev_ds,
         batch_size=batch_size,
         shuffle=False,
         collate_fn=collate_fn,
-        num_workers=cfg.get("num_workers", 0),
+        num_workers=num_workers,
+        persistent_workers=persistent_workers,
     )
 
     # ---- Model ----
