@@ -97,6 +97,11 @@ def parse_args() -> argparse.Namespace:
     # 再現性オプション (v7)
     p.add_argument("--seed",              type=int,   default=None,
                    help="乱数シード（Python / NumPy / PyTorch を一括固定）。未指定時は固定しない。")
+    # エンコーダ凍結オプション (v13)
+    p.add_argument("--freeze_encoder",    action="store_true", default=None,
+                   help="Transformer エンコーダを凍結してタスクヘッドのみ学習する。"
+                        "バックワードパスがエンコーダを通らないため 2〜4× の高速化が得られる。"
+                        "LoRA と同時に指定した場合は LoRA が優先される。")
     return p.parse_args()
 
 
@@ -155,6 +160,9 @@ def main() -> None:
     # 再現性オプション
     if args.seed is not None:
         cfg["seed"] = args.seed
+    # エンコーダ凍結オプション (v13)
+    if args.freeze_encoder:
+        cfg["freeze_encoder"] = True
 
     logger.info("Config: %s", json.dumps(cfg, indent=2, ensure_ascii=False))
 
@@ -250,6 +258,8 @@ def main() -> None:
         lora_target_modules=cfg.get("lora_target_modules", None),
         # v10: スパングラフ伝播
         coref_prop=cfg.get("coref_prop", 1),
+        # v13: エンコーダ凍結
+        freeze_encoder=cfg.get("freeze_encoder", False),
     )
 
     # ---- Trainer ----

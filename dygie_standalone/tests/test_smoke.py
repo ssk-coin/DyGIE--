@@ -1226,6 +1226,88 @@ def test_excluded_gold_count() -> None:
     print("  [OK] NERMetrics / RelationMetrics の extra_fn が正しく FN に追加される")
 
 
+def test_freeze_encoder() -> None:
+    """v13: freeze_encoder=True でエンコーダが凍結され、タスクヘッドのみ学習されることを確認する。"""
+    tok = _TOK
+    ds = DyGIEDataset(SAMPLE, tok, max_span_width=4, max_total_length=128)
+
+    # freeze_encoder=True モデル
+    model_frozen = DyGIE(
+        transformer_model=MODEL_NAME,
+        ner_labels=ds.ner_labels,
+        rel_labels=ds.rel_labels,
+        max_span_width=4,
+        use_ner=True,
+        use_rel=True,
+        use_coref=False,
+        feedforward_dim=64,
+        width_embedding_dim=32,
+        dropout=0.0,
+        freeze_encoder=True,
+    )
+
+    # エンコーダの全パラメータが凍結されているか確認
+    encoder_params = list(model_frozen.encoder.parameters())
+    assert all(not p.requires_grad for p in encoder_params), \
+        "freeze_encoder=True のとき、エンコーダの全パラメータが凍結されるべき"
+
+    # タスクヘッドは学習可能か確認
+    task_params = [p for p in model_frozen.parameters() if p.requires_grad]
+    assert len(task_params) > 0, "タスクヘッドのパラメータは requires_grad=True であるべき"
+
+    # freeze_encoder=False モデルはエンコーダが学習可能
+    model_normal = DyGIE(
+        transformer_model=MODEL_NAME,
+        ner_labels=ds.ner_labels,
+        rel_labels=ds.rel_labels,
+        max_span_width=4,
+        use_ner=True,
+        use_rel=True,
+        use_coref=False,
+        feedforward_dim=64,
+        width_embedding_dim=32,
+        dropout=0.0,
+        freeze_encoder=False,
+    )
+    encoder_params_normal = list(model_normal.encoder.parameters())
+    assert all(p.requires_grad for p in encoder_params_normal), \
+        "freeze_encoder=False のとき、エンコーダは学習可能であるべき"
+
+    # フォワードパスが正常に動作するか確認
+    loader = DataLoader(ds, batch_size=2, collate_fn=collate_fn)
+    batch = next(iter(loader))
+    model_frozen.eval()
+    with torch.no_grad():
+        out = model_frozen(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            token_to_subword=batch["token_to_subword"],
+            spans=batch["spans"],
+            span_mask=batch["span_mask"],
+            num_tokens=batch["num_tokens"],
+        )
+    assert "ner_preds" in out, "freeze_encoder=True でも forward が動作すべき"
+
+    # save_pretrained / from_pretrained で freeze_encoder が保存・復元されるか確認
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        model_frozen.save_pretrained(tmp)
+        model_loaded = DyGIE.from_pretrained(tmp)
+        assert model_loaded.freeze_encoder is True, \
+            "freeze_encoder が save/load で正しく復元されるべき"
+        # ロード後もエンコーダが凍結されているか
+        enc_params_loaded = list(model_loaded.encoder.parameters())
+        assert all(not p.requires_grad for p in enc_params_loaded), \
+            "from_pretrained 後もエンコーダが凍結されているべき"
+
+    frozen_count = sum(1 for p in model_frozen.parameters() if not p.requires_grad)
+    trainable_count = sum(1 for p in model_frozen.parameters() if p.requires_grad)
+    print(
+        f"  [OK] freeze_encoder: encoder frozen ({frozen_count} param tensors), "
+        f"task head trainable ({trainable_count} param tensors)"
+    )
+
+
 if __name__ == "__main__":
     tests = [
         ("Dataset",                           test_dataset),
@@ -1247,6 +1329,7 @@ if __name__ == "__main__":
         ("RE eval end-to-end consistency",    test_re_eval_consistency),
         ("coref_prop parameter",              test_coref_prop),
         ("excluded gold count (v12)",         test_excluded_gold_count),
+        ("freeze_encoder (v13)",              test_freeze_encoder),
     ]
     print("\n===== DyGIE++ Standalone Smoke Tests =====")
     passed = failed = 0
