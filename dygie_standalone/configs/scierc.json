@@ -71,6 +71,11 @@
   "focal_loss_gamma": 2.0,
   "_comment_focal_loss_gamma": "RE Focal Loss の gamma パラメータ。0 で通常の CrossEntropyLoss。2.0 が標準的な値。SciERC の RE は「関係なし」が多数派のため focal loss が効果的。",
 
+  "_comment_freeze": "=== エンコーダ凍結オプション (v13) ===",
+
+  "freeze_encoder": false,
+  "_comment_freeze_encoder": "true にすると Transformer エンコーダ全体を凍結し、タスクヘッドのみ学習する。バックワードパスがエンコーダを通らないため 2〜4× 高速化される。use_lora=true と同時に指定した場合は LoRA が優先（LoRA アダプタのみ学習）。",
+
   "_comment_lora": "=== LoRA アダプタ オプション (v6) ===",
 
   "use_lora": false,

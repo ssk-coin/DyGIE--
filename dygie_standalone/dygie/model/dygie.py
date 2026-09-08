@@ -160,6 +160,8 @@ class DyGIE(nn.Module):
         lora_target_modules: list[str] | None = None,
         # スパングラフ伝播 (v10)
         coref_prop: int = 1,
+        # エンコーダ凍結 (v13)
+        freeze_encoder: bool = False,
     ) -> None:
         super().__init__()
 
@@ -215,6 +217,8 @@ class DyGIE(nn.Module):
             "lora_target_modules": lora_target_modules or ["query", "value"],
             # v10: スパングラフ伝播
             "coref_prop": coref_prop,
+            # v13: エンコーダ凍結
+            "freeze_encoder": freeze_encoder,
         }
 
         # ---- Transformer encoder ----
@@ -248,6 +252,25 @@ class DyGIE(nn.Module):
                 "trainable params: %d / %d (%.2f%%)",
                 lora_r, lora_alpha, _target_modules,
                 trainable, total, 100 * trainable / max(total, 1),
+            )
+
+        # ---- エンコーダ凍結 (v13) ----
+        # Transformer エンコーダの全パラメータを凍結し、タスクヘッドのみ学習する。
+        # バックワードパスでエンコーダを通らないため大幅な高速化（2〜4×）が得られる。
+        # LoRA と同時に指定した場合は LoRA が優先（LoRA の A/B 行列は requires_grad=True）。
+        self.freeze_encoder = freeze_encoder
+        if freeze_encoder and not use_lora:
+            for param in self.encoder.parameters():
+                param.requires_grad = False
+            logger.info(
+                "Encoder frozen: all %d encoder parameters set to requires_grad=False.",
+                sum(p.numel() for p in self.encoder.parameters()),
+            )
+        elif freeze_encoder and use_lora:
+            logger.warning(
+                "freeze_encoder=True と use_lora=True が同時に指定されました。"
+                "LoRA が優先されます（LoRA アダプタのみ学習）。"
+                "freeze_encoder の効果は LoRA に吸収されているため無視します。"
             )
 
         # 勾配チェックポイント: エンコーダの活性化メモリを 50〜70% 削減
