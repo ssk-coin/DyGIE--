@@ -38,10 +38,11 @@ RE スコア改善 (v4):
   元の DyGIE++ 実装に合わせて RE ヘッドを修正。
   旧実装では span_repr を feedforward_dim (150-dim) に独立に射影してからペア化
   していたため、クロススパン相互作用が失われていた。
-  修正後は [span1_repr; span2_repr; type; dist] を直接連結してから 1 層 MLP で
-  分類する（元論文と同じアーキテクチャ）。
-  同時に pair_mlp を 2 層 + LayerNorm + 2x Dropout から 1 層 + 1x Dropout に
-  簡略化し、過剰な正則化を解消する。
+  修正後は span_proj で 512-dim に射影してから [proj1; proj2; type; dist] を
+  連結して 1 層 MLP で分類する。
+  - 512-dim 射影: 旧 150-dim ボトルネックを解消しつつ O(E) コストのみ
+  - pair_input_dim: 512*2 + type_dim + dist_dim ≈ 1280 (旧 5184-dim より ~4× 小）
+  - pair_mlp: 2 層 + LayerNorm + 2x Dropout から 1 層 + 1x Dropout に簡略化
 """
 
 from __future__ import annotations
@@ -177,11 +178,20 @@ class RelationModule(nn.Module):
         else:
             dist_feat_dim = 0
 
-        # ---- Pair MLP: 元の DyGIE++ と同様に [span1; span2; type; dist] を直接入力 ----
-        # span_proj は使わず、生の span_repr をそのままペア化する。
-        # 独立射影してからペア化すると 150-dim のボトルネックでクロススパン情報が
-        # 失われるため、元論文に従い全次元を結合してから 1 層 MLP で分類する。
-        pair_input_dim = span_dim * 2 + type_feat_dim + dist_feat_dim
+        # ---- span_proj: span_dim → span_proj_dim ----
+        # E² ペアの pair_mlp に渡す前に各スパン表現を射影する（計算量 O(E) のみ）。
+        # 旧実装の 150-dim ボトルネックをなくすため 512-dim で射影する。
+        # これにより pair_mlp 入力の quadratic 計算量を ~4× 削減しつつ、
+        # 150-dim 射影より遥かに多くの情報を保持できる。
+        span_proj_dim = 512
+        self.span_proj = nn.Sequential(
+            nn.Linear(span_dim, span_proj_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+
+        # ---- Pair MLP: [proj1; proj2; type; dist] → ff_dim ----
+        pair_input_dim = span_proj_dim * 2 + type_feat_dim + dist_feat_dim
         self.pair_mlp = nn.Sequential(
             nn.Linear(pair_input_dim, feedforward_dim),
             nn.ReLU(),
@@ -236,18 +246,17 @@ class RelationModule(nn.Module):
             if E < 2:
                 # エンティティが 0 or 1 個ならペアなし → 損失への寄与なし
                 if rel_labels is not None:
-                    grad_anchors.append(span_repr[b].sum() * 0.0)
+                    grad_anchors.append(self.span_proj[0].weight.sum() * 0.0)
                 continue
 
-            # エンティティスパンの生表現を収集: [E, span_dim]
-            e_repr = span_repr[b].index_select(0, e_idx)
+            # エンティティスパンを 512-dim に射影: [E, span_proj_dim]
+            # span_proj は O(E) のみ、pair_mlp の E² 計算量を削減する。
+            e_proj = self.span_proj(span_repr[b].index_select(0, e_idx))
 
             # ---- ペア表現の構築 ----
-            # 元の DyGIE++ と同様に [span1_repr; span2_repr] を直接連結する。
-            # 独立射影してからペア化すると 150-dim のボトルネックで
-            # クロススパン相互作用が失われるため、生の span_repr を使用する。
-            src = e_repr.unsqueeze(1).expand(-1, E, -1)    # [E, E, span_dim]
-            tgt = e_repr.unsqueeze(0).expand(E, -1, -1)    # [E, E, span_dim]
+            # [span1_proj; span2_proj] を連結してからペア MLP へ渡す。
+            src = e_proj.unsqueeze(1).expand(-1, E, -1)    # [E, E, span_proj_dim]
+            tgt = e_proj.unsqueeze(0).expand(E, -1, -1)    # [E, E, span_proj_dim]
             parts = [src, tgt]
 
             # エンティティタイプ埋め込み [E, E, type_emb_dim] × 2
