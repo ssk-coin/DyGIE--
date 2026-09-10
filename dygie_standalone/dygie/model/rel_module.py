@@ -152,6 +152,7 @@ class RelationModule(nn.Module):
         num_distance_buckets: int = 10,
         distance_embedding_dim: int = 64,
         focal_loss_gamma: float = 0.0,
+        span_proj_dim: int = 512,
     ) -> None:
         super().__init__()
         self.num_rel_labels = num_rel_labels
@@ -180,10 +181,10 @@ class RelationModule(nn.Module):
 
         # ---- span_proj: span_dim → span_proj_dim ----
         # E² ペアの pair_mlp に渡す前に各スパン表現を射影する（計算量 O(E) のみ）。
-        # 旧実装の 150-dim ボトルネックをなくすため 512-dim で射影する。
-        # これにより pair_mlp 入力の quadratic 計算量を ~4× 削減しつつ、
-        # 150-dim 射影より遥かに多くの情報を保持できる。
-        span_proj_dim = 512
+        # span_proj_dim は設定ファイルで指定可能（デフォルト 512）。
+        # 小さいほど高速・メモリ節約（情報損失リスクあり）。
+        # 大きいほど表現力向上（BERT hidden dim 768 に合わせる場合は 768 など）。
+        self.span_proj_dim = span_proj_dim
         self.span_proj = nn.Sequential(
             nn.Linear(span_dim, span_proj_dim),
             nn.ReLU(),

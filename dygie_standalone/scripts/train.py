@@ -87,6 +87,10 @@ def parse_args() -> argparse.Namespace:
                    help="距離埋め込みの次元数（0=無効）")
     p.add_argument("--focal_loss_gamma",  type=float, default=None,
                    help="RE Focal Loss の gamma 値（0=通常の CE、2.0 が推奨）")
+    p.add_argument("--span_proj_dim",     type=int,   default=None,
+                   help="RE span_proj の射影次元数（デフォルト 512）。"
+                        "小さいほど高速・メモリ節約、大きいほど表現力向上。"
+                        "0 を指定すると span_proj を使わず span_dim をそのまま使う（非推奨）。")
     # イベント抽出オプション
     p.add_argument("--use_event",         action="store_true", default=None,
                    help="イベント抽出タスクを有効化")
@@ -145,7 +149,8 @@ def main() -> None:
                 "patience", "early_stopping_warmup", "early_stopping_metric",
                 "gradient_accumulation_steps", "max_spans",
                 "type_embedding_dim", "num_distance_buckets",
-                "distance_embedding_dim", "focal_loss_gamma"]:
+                "distance_embedding_dim", "focal_loss_gamma",
+                "span_proj_dim"]:
         val = getattr(args, key, None)
         if val is not None:
             cfg[key] = val
@@ -261,6 +266,7 @@ def main() -> None:
         num_distance_buckets=cfg.get("num_distance_buckets", 10),
         distance_embedding_dim=cfg.get("distance_embedding_dim", 64),
         focal_loss_gamma=cfg.get("focal_loss_gamma", 0.0),
+        span_proj_dim=cfg.get("span_proj_dim", 512),
         # v5: イベント抽出
         use_event=use_event,
         event_type_labels=train_ds.event_type_labels if use_event else None,
