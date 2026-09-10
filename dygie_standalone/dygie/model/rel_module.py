@@ -190,8 +190,10 @@ class RelationModule(nn.Module):
             nn.Dropout(dropout),
         )
 
-        # ---- Pair MLP: [proj1; proj2; type; dist] → ff_dim ----
-        pair_input_dim = span_proj_dim * 2 + type_feat_dim + dist_feat_dim
+        # ---- Pair MLP: [proj1; proj2; proj1⊙proj2; type; dist] → ff_dim ----
+        # DyGIE++ 論文の h_ij = f([g_i; g_j; g_i⊙g_j; φ(τ_i); φ(τ_j)]) に合わせ
+        # 要素積（element-wise product）を追加。スパン間の相互作用パターンを直接学習できる。
+        pair_input_dim = span_proj_dim * 3 + type_feat_dim + dist_feat_dim
         self.pair_mlp = nn.Sequential(
             nn.Linear(pair_input_dim, feedforward_dim),
             nn.ReLU(),
@@ -254,10 +256,12 @@ class RelationModule(nn.Module):
             e_proj = self.span_proj(span_repr[b].index_select(0, e_idx))
 
             # ---- ペア表現の構築 ----
-            # [span1_proj; span2_proj] を連結してからペア MLP へ渡す。
+            # DyGIE++ 論文: h_ij = f([g_i; g_j; g_i⊙g_j; φ(τ_i); φ(τ_j)])
+            # 要素積 (element-wise product) がスパン間の相互作用パターンを捉える。
             src = e_proj.unsqueeze(1).expand(-1, E, -1)    # [E, E, span_proj_dim]
             tgt = e_proj.unsqueeze(0).expand(E, -1, -1)    # [E, E, span_proj_dim]
-            parts = [src, tgt]
+            interaction = src * tgt                         # [E, E, span_proj_dim]
+            parts = [src, tgt, interaction]
 
             # エンティティタイプ埋め込み [E, E, type_emb_dim] × 2
             if self.use_type_embedding:
