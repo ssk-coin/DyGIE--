@@ -39,6 +39,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from dygie.training.metrics import NERMetrics, RelationMetrics, CorefMetrics
+from dygie.version import print_version_header
 
 
 def parse_args() -> argparse.Namespace:
@@ -90,6 +91,9 @@ def _span_in_range(s: int, e: int, max_span_width: int) -> bool:
 
 
 def main() -> None:
+    # バージョン情報をログ冒頭に表示（実験結果と対応付けるため）
+    print_version_header()
+
     args = parse_args()
 
     # max_span_width の決定

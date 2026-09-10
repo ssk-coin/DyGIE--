@@ -196,6 +196,7 @@ class Trainer:
         # metrics
         self.ner_metrics = NERMetrics()
         self.rel_metrics = RelationMetrics()
+        self.rel_metrics_gold = RelationMetrics()   # gold NER スパンを使った RE 評価（診断用）
         self.coref_metrics = CorefMetrics()
         self.event_metrics = EventMetrics()
 
@@ -372,6 +373,7 @@ class Trainer:
         self.model.eval()
         self.ner_metrics.reset()
         self.rel_metrics.reset()
+        self.rel_metrics_gold.reset()
         self.coref_metrics.reset()
         self.event_metrics.reset()
 
@@ -386,6 +388,25 @@ class Trainer:
                 num_tokens=batch["num_tokens"],
                 use_gold_spans=False,  # 推論時は predicted NER / trigger を使用
             )
+
+            # ---- gold NER 条件での RE 評価（診断用） ----
+            # DyGIE++ 論文が報告する RE F1 は gold NER スパンを使う場合が多い。
+            # ここでは gold NER スパンを強制使用した RE 予測を別途評価し
+            # end-to-end RE F1 との乖離を可視化する。
+            outputs_gold_ner = None
+            if self.model.use_rel:
+                with torch.no_grad():
+                    outputs_gold_ner = self.model(
+                        input_ids=batch["input_ids"],
+                        attention_mask=batch["attention_mask"],
+                        token_to_subword=batch["token_to_subword"],
+                        spans=batch["spans"],
+                        span_mask=batch["span_mask"],
+                        num_tokens=batch["num_tokens"],
+                        use_gold_spans=True,
+                        ner_labels=batch.get("ner_labels"),
+                        rel_labels=None,        # 損失は不要
+                    )
 
             if self.model.use_ner and "ner_preds" in outputs:
                 self.ner_metrics.update(
@@ -406,13 +427,21 @@ class Trainer:
                 full_pair_mask = sm.unsqueeze(2) & sm.unsqueeze(1)   # [B, K, K]
                 eye = torch.eye(K_size, dtype=torch.bool).unsqueeze(0)
                 full_pair_mask = full_pair_mask & ~eye                # 自己ループ除外
+                extra_fn = batch.get("rel_excluded_gold_count", 0)
                 self.rel_metrics.update(
                     preds=outputs["rel_preds"].cpu(),
                     golds=batch["rel_labels"].cpu(),
                     pair_mask=full_pair_mask,
-                    # max_span_width で除外された gold 関係を FN に追加
-                    extra_fn=batch.get("rel_excluded_gold_count", 0),
+                    extra_fn=extra_fn,
                 )
+                # gold NER 条件での RE 評価（診断用）
+                if outputs_gold_ner is not None and "rel_preds" in outputs_gold_ner:
+                    self.rel_metrics_gold.update(
+                        preds=outputs_gold_ner["rel_preds"].cpu(),
+                        golds=batch["rel_labels"].cpu(),
+                        pair_mask=full_pair_mask,
+                        extra_fn=extra_fn,
+                    )
 
             if self.model.use_coref and "top_span_indices" in outputs:
                 for b in range(batch["input_ids"].size(0)):
@@ -451,6 +480,11 @@ class Trainer:
             metrics.update(self.ner_metrics.compute())
         if self.model.use_rel:
             metrics.update(self.rel_metrics.compute())
+            # gold NER 条件での RE F1 を "rel_f1_gold_ner" として追加（診断用）
+            gold_rel = self.rel_metrics_gold.compute()
+            metrics["rel_f1_gold_ner"] = gold_rel["rel_f1"]
+            metrics["rel_precision_gold_ner"] = gold_rel["rel_precision"]
+            metrics["rel_recall_gold_ner"]    = gold_rel["rel_recall"]
         if self.model.use_coref:
             metrics.update(self.coref_metrics.compute())
         if self.model.use_event:

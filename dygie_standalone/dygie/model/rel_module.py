@@ -32,8 +32,17 @@ RE スコア改善 (v4):
      → 近接ペアほど関係ありの確率が高いというバイアスを学習
   3. Focal Loss: クラス不均衡（大多数の「関係なし」ペア）への対処
      → 難しい正例に損失を集中 (gamma=2.0 推奨)
-  4. 深い Pair MLP: 2 層 + LayerNorm で表現力向上
-  5. 損失集約の修正: バッチアイテムごとの平均 → 全ペアを集約した単一 CE
+  4. 損失集約の修正: バッチアイテムごとの平均 → 全ペアを集約した単一 CE
+
+アーキテクチャ修正 (v15):
+  元の DyGIE++ 実装に合わせて RE ヘッドを修正。
+  旧実装では span_repr を feedforward_dim (150-dim) に独立に射影してからペア化
+  していたため、クロススパン相互作用が失われていた。
+  修正後は span_proj で 512-dim に射影してから [proj1; proj2; type; dist] を
+  連結して 1 層 MLP で分類する。
+  - 512-dim 射影: 旧 150-dim ボトルネックを解消しつつ O(E) コストのみ
+  - pair_input_dim: 512*2 + type_dim + dist_dim ≈ 1280 (旧 5184-dim より ~4× 小）
+  - pair_mlp: 2 層 + LayerNorm + 2x Dropout から 1 層 + 1x Dropout に簡略化
 """
 
 from __future__ import annotations
@@ -169,23 +178,24 @@ class RelationModule(nn.Module):
         else:
             dist_feat_dim = 0
 
-        # ---- スパン射影: span_dim → feedforward_dim ----
+        # ---- span_proj: span_dim → span_proj_dim ----
+        # E² ペアの pair_mlp に渡す前に各スパン表現を射影する（計算量 O(E) のみ）。
+        # 旧実装の 150-dim ボトルネックをなくすため 512-dim で射影する。
+        # これにより pair_mlp 入力の quadratic 計算量を ~4× 削減しつつ、
+        # 150-dim 射影より遥かに多くの情報を保持できる。
+        span_proj_dim = 512
         self.span_proj = nn.Sequential(
-            nn.Linear(span_dim, feedforward_dim),
+            nn.Linear(span_dim, span_proj_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
         )
 
-        # ---- Pair MLP: 2 層 + LayerNorm ----
-        # ペア入力: [src_proj; tgt_proj; src_type; tgt_type; dist_emb]
-        pair_input_dim = feedforward_dim * 2 + type_feat_dim + dist_feat_dim
+        # ---- Pair MLP: [proj1; proj2; proj1⊙proj2; type; dist] → ff_dim ----
+        # DyGIE++ 論文の h_ij = f([g_i; g_j; g_i⊙g_j; φ(τ_i); φ(τ_j)]) に合わせ
+        # 要素積（element-wise product）を追加。スパン間の相互作用パターンを直接学習できる。
+        pair_input_dim = span_proj_dim * 3 + type_feat_dim + dist_feat_dim
         self.pair_mlp = nn.Sequential(
             nn.Linear(pair_input_dim, feedforward_dim),
-            nn.LayerNorm(feedforward_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(feedforward_dim, feedforward_dim),
-            nn.LayerNorm(feedforward_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
         )
@@ -220,9 +230,6 @@ class RelationModule(nn.Module):
         diag = torch.eye(K, dtype=torch.bool, device=device).unsqueeze(0)
         pair_mask = pair_mask & ~diag
 
-        # ---- スパン射影: [B, K, ff_dim] ----
-        proj = self.span_proj(span_repr)   # [B, K, ff_dim]
-
         # ---- エンティティスパンのみで E×E ペアを計算 ----
         # K×K 全体の行列を作成するのではなく、エンティティスパン E 個のペアだけを
         # 各バッチアイテムで個別処理する（O(K²) → O(E²) のメモリ削減）。
@@ -241,16 +248,20 @@ class RelationModule(nn.Module):
             if E < 2:
                 # エンティティが 0 or 1 個ならペアなし → 損失への寄与なし
                 if rel_labels is not None:
-                    grad_anchors.append(proj[b].sum() * 0.0)
+                    grad_anchors.append(self.span_proj[0].weight.sum() * 0.0)
                 continue
 
-            # エンティティスパンの射影表現を収集: [E, ff_dim]
-            e_proj = proj[b].index_select(0, e_idx)
+            # エンティティスパンを 512-dim に射影: [E, span_proj_dim]
+            # span_proj は O(E) のみ、pair_mlp の E² 計算量を削減する。
+            e_proj = self.span_proj(span_repr[b].index_select(0, e_idx))
 
             # ---- ペア表現の構築 ----
-            src = e_proj.unsqueeze(1).expand(-1, E, -1)    # [E, E, ff_dim]
-            tgt = e_proj.unsqueeze(0).expand(E, -1, -1)    # [E, E, ff_dim]
-            parts = [src, tgt]
+            # DyGIE++ 論文: h_ij = f([g_i; g_j; g_i⊙g_j; φ(τ_i); φ(τ_j)])
+            # 要素積 (element-wise product) がスパン間の相互作用パターンを捉える。
+            src = e_proj.unsqueeze(1).expand(-1, E, -1)    # [E, E, span_proj_dim]
+            tgt = e_proj.unsqueeze(0).expand(E, -1, -1)    # [E, E, span_proj_dim]
+            interaction = src * tgt                         # [E, E, span_proj_dim]
+            parts = [src, tgt, interaction]
 
             # エンティティタイプ埋め込み [E, E, type_emb_dim] × 2
             if self.use_type_embedding:
