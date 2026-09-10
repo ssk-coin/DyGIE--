@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from dygie.data import DyGIEDataset, collate_fn
 from dygie.model import DyGIE
 from dygie.training import Trainer
+from dygie.version import print_version_header
 
 logging.basicConfig(
     level=logging.INFO,
@@ -130,6 +131,9 @@ def _set_seed(seed: int) -> None:
 
 
 def main() -> None:
+    # バージョン情報をログ冒頭に表示（実験結果と対応付けるため）
+    print_version_header()
+
     args = parse_args()
 
     with open(args.config, "r") as f:
