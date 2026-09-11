@@ -143,12 +143,16 @@ class RelationModule(nn.Module):
         num_distance_buckets: int = 10,
         distance_embedding_dim: int = 64,
         focal_loss_gamma: float = 0.0,
+        span_proj_dim: int = 512,
     ) -> None:
         super().__init__()
         self.num_rel_labels = num_rel_labels
         self.focal_loss_gamma = focal_loss_gamma
         self.use_distance_feature = use_distance_feature
         self.num_distance_buckets = num_distance_buckets
+
+        # span_proj_dim=0 のときは span_proj を使わず span_dim をそのまま使う
+        self._proj_dim = span_proj_dim if span_proj_dim > 0 else span_dim
 
         # ---- エンティティタイプ埋め込み ----
         self.use_type_embedding = (num_ner_labels > 0 and type_embedding_dim > 0)
@@ -169,16 +173,20 @@ class RelationModule(nn.Module):
         else:
             dist_feat_dim = 0
 
-        # ---- スパン射影: span_dim → feedforward_dim ----
-        self.span_proj = nn.Sequential(
-            nn.Linear(span_dim, feedforward_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-        )
+        # ---- スパン射影: span_dim → span_proj_dim ----
+        # span_proj_dim=0 のときは恒等写像（射影なし）
+        if span_proj_dim > 0:
+            self.span_proj = nn.Sequential(
+                nn.Linear(span_dim, span_proj_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+            )
+        else:
+            self.span_proj = nn.Identity()  # type: ignore
 
         # ---- Pair MLP: 2 層 + LayerNorm ----
         # ペア入力: [src_proj; tgt_proj; src_type; tgt_type; dist_emb]
-        pair_input_dim = feedforward_dim * 2 + type_feat_dim + dist_feat_dim
+        pair_input_dim = self._proj_dim * 2 + type_feat_dim + dist_feat_dim
         self.pair_mlp = nn.Sequential(
             nn.Linear(pair_input_dim, feedforward_dim),
             nn.LayerNorm(feedforward_dim),

@@ -66,6 +66,9 @@
   "focal_loss_gamma": 2.0,
   "_comment_focal_loss_gamma": "RE Focal Loss の gamma パラメータ。0 で通常の CrossEntropyLoss。2.0 が標準的な値。SciERC の RE は「関係なし」が多数派のため focal loss が効果的。",
 
+  "span_proj_dim": 512,
+  "_comment_span_proj_dim": "RE ペア計算前に span_repr を射影する次元数。小さいほど高速・省メモリ（情報損失リスクあり）。大きいほど表現力が向上。目安: 256=高速、512=バランス（デフォルト）、768=BERT hidden dim 相当。0 を指定すると span_proj を使わず span_dim をそのまま使う（非推奨）。",
+
   "_comment_lora": "=== LoRA アダプタ オプション (v6) ===",
 
   "use_lora": false,

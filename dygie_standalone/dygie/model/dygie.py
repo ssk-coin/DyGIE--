@@ -141,6 +141,7 @@ class DyGIE(nn.Module):
         num_distance_buckets: int = 10,
         distance_embedding_dim: int = 64,
         focal_loss_gamma: float = 0.0,
+        span_proj_dim: int = 512,
         # イベント抽出 (v5)
         use_event: bool = False,
         event_type_labels: list[str] | None = None,
@@ -193,6 +194,7 @@ class DyGIE(nn.Module):
             "num_distance_buckets": num_distance_buckets,
             "distance_embedding_dim": distance_embedding_dim,
             "focal_loss_gamma": focal_loss_gamma,
+            "span_proj_dim": span_proj_dim,
             # v5: イベント抽出
             "use_event": use_event,
             "event_type_labels": self.event_type_labels,
@@ -279,6 +281,7 @@ class DyGIE(nn.Module):
                 num_distance_buckets=num_distance_buckets,
                 distance_embedding_dim=distance_embedding_dim,
                 focal_loss_gamma=focal_loss_gamma,
+                span_proj_dim=span_proj_dim,
             )
         else:
             self.rel_module = None  # type: ignore
