@@ -1,5 +1,5 @@
 """
-DyGIE-- — Dataset
+DyGIE-- Standalone — Dataset
 SciERC / DyGIE++ JSON Lines 形式を読み込み、PyTorch Dataset として提供します。
 
 各行の形式:
@@ -280,7 +280,12 @@ class DyGIEDataset(Dataset):
         span_index: dict[tuple[int, int], int] = {s: i for i, s in enumerate(spans)}
 
         # ---- (3) NER ラベル ----
+        # スパン幅が max_span_width を超える gold エンティティは span_index に存在しないため
+        # ner_labels_tensor では label=0（no entity）として扱われる。
+        # これらは trainer のメトリクスで FN に加算されない（recall 過大評価の原因）。
+        # ner_excluded_gold_count にカウントし、後で FN に追加する。
         ner_labels_tensor = torch.zeros(K, dtype=torch.long)
+        ner_excluded_gold_count = 0
         if self.use_ner:
             # DyGIE++ の NER インデックスはドキュメント全体のフラットインデックスなので
             # 文ごとのループでも tok_offset 補正は不要
@@ -290,9 +295,14 @@ class DyGIEDataset(Dataset):
                     key = (gs, ge)
                     if key in span_index and lbl in self.ner_label2id:
                         ner_labels_tensor[span_index[key]] = self.ner_label2id[lbl]
+                    elif lbl in self.ner_label2id:
+                        # span_index に存在しない → max_span_width 超過または truncation による除外
+                        ner_excluded_gold_count += 1
 
         # ---- (4) RE ラベル ----
+        # 同様に、どちらかのエンドポイントが span_index に存在しない gold 関係も除外される。
         rel_labels_tensor = torch.zeros((K, K), dtype=torch.long)
+        rel_excluded_gold_count = 0
         if self.use_rel:
             for s_idx, sent in enumerate(sentences):
                 for annot in doc.get("relations", [[]] * len(sentences))[s_idx] if s_idx < len(doc.get("relations", [])) else []:
@@ -301,6 +311,9 @@ class DyGIEDataset(Dataset):
                     k2 = span_index.get((s2, e2))
                     if k1 is not None and k2 is not None and lbl in self.rel_label2id:
                         rel_labels_tensor[k1, k2] = self.rel_label2id[lbl]
+                    elif lbl in self.rel_label2id:
+                        # どちらかのスパンが span_index 外 → 除外カウント
+                        rel_excluded_gold_count += 1
 
         # ---- (5) Coref クラスタ（評価用・生データのまま保持） ----
         coref_clusters: list[list[tuple[int, int]]] = []
@@ -314,6 +327,8 @@ class DyGIEDataset(Dataset):
         #   event = [[trigger_start, trigger_end, event_type], [arg_start, arg_end, role], ...]
         event_trigger_labels_tensor = torch.zeros(K, dtype=torch.long)
         event_arg_labels_tensor = torch.zeros((K, K), dtype=torch.long)
+        event_trigger_excluded_gold_count = 0
+        event_arg_excluded_gold_count = 0
         if self.use_event:
             for s_idx in range(len(sentences)):
                 sent_events = doc.get("events", [])
@@ -328,12 +343,16 @@ class DyGIEDataset(Dataset):
                     t_k = span_index.get(t_key)
                     if t_k is not None and t_type in self.event_type_label2id:
                         event_trigger_labels_tensor[t_k] = self.event_type_label2id[t_type]
+                    elif t_type in self.event_type_label2id:
+                        event_trigger_excluded_gold_count += 1
                     # 引数
                     for arg in event[1:]:
                         a_start, a_end, role = arg[0], arg[1], arg[2]
                         a_k = span_index.get((a_start, a_end))
                         if t_k is not None and a_k is not None and role in self.arg_role_label2id:
                             event_arg_labels_tensor[t_k, a_k] = self.arg_role_label2id[role]
+                        elif role in self.arg_role_label2id:
+                            event_arg_excluded_gold_count += 1
 
         # ---- (7) スパン数の上限設定（メモリ節約）----
         # max_spans > 0 のとき、先頭 max_spans 件に切り捨てる。
@@ -360,4 +379,10 @@ class DyGIEDataset(Dataset):
             "event_trigger_labels": event_trigger_labels_tensor,  # [K]
             "event_arg_labels": event_arg_labels_tensor,          # [K, K]
             "num_tokens": valid_num_tokens,
+            # max_span_width によって除外された gold アノテーションの数。
+            # trainer がこれを extra_fn としてメトリクスに渡し、recall が正確になる。
+            "ner_excluded_gold_count": ner_excluded_gold_count,
+            "rel_excluded_gold_count": rel_excluded_gold_count,
+            "event_trigger_excluded_gold_count": event_trigger_excluded_gold_count,
+            "event_arg_excluded_gold_count": event_arg_excluded_gold_count,
         }

@@ -1,5 +1,5 @@
 """
-DyGIE-- — Coreference Resolution Module
+DyGIE-- Standalone — Coreference Resolution Module
 
 DyGIE++ / Lee et al. (2018) スタイルの coref ヘッド。
 

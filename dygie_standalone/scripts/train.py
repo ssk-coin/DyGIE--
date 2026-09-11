@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DyGIE-- — 学習スクリプト
+DyGIE-- Standalone — 学習スクリプト
 
 使い方:
   python scripts/train.py \
@@ -19,8 +19,14 @@ import sys
 from pathlib import Path
 
 import torch
+import torch.multiprocessing as mp
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
+
+# num_workers > 0 のとき、Linux のデフォルト共有戦略 (file_descriptor) は
+# ファイルディスクリプタを大量消費して "Too many open files" を引き起こす。
+# file_system 戦略は tmpfs 上の一時ファイルで共有するため fd を消費しない。
+mp.set_sharing_strategy("file_system")
 
 # プロジェクトルートを sys.path に追加
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -28,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from dygie.data import DyGIEDataset, collate_fn
 from dygie.model import DyGIE
 from dygie.training import Trainer
+from dygie.version import print_version_header
 
 logging.basicConfig(
     level=logging.INFO,
@@ -57,6 +64,11 @@ def parse_args() -> argparse.Namespace:
                    help="Early stopping のエポック数（0=無効）")
     p.add_argument("--early_stopping_warmup", type=int, default=None,
                    help="Early stopping を開始するまでのウォームアップエポック数（デフォルト 20）")
+    p.add_argument("--early_stopping_metric", type=str, default=None,
+                   help="Early stopping の判定メトリクス。"
+                        "省略形: ner/rel/coref/event。"
+                        "フルキー: ner_f1/rel_f1/conll_f1/event_trigger_f1/event_arg_f1 など。"
+                        "'auto' で有効タスクから自動選択（デフォルト: ner_f1）。")
     p.add_argument("--gradient_accumulation_steps", type=int, default=None,
                    help="勾配蓄積ステップ数（デフォルト 1）")
     # メモリ最適化オプション
@@ -78,7 +90,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--span_proj_dim",     type=int,   default=None,
                    help="RE span_proj の射影次元数（デフォルト 512）。"
                         "小さいほど高速・メモリ節約、大きいほど表現力向上。"
-                        "0 を指定すると span_proj を使わず span_dim をそのまま使う（非推奨）。")
+                        "0 を指定すると射影なし（非推奨）。")
     # イベント抽出オプション
     p.add_argument("--use_event",         action="store_true", default=None,
                    help="イベント抽出タスクを有効化")
@@ -93,10 +105,39 @@ def parse_args() -> argparse.Namespace:
                    help="LoRA のスケーリング係数（デフォルト 32）")
     p.add_argument("--lora_dropout",      type=float, default=None,
                    help="LoRA アダプタ内の Dropout 率（デフォルト 0.1）")
+    # 再現性オプション (v7)
+    p.add_argument("--seed",              type=int,   default=None,
+                   help="乱数シード（Python / NumPy / PyTorch を一括固定）。未指定時は固定しない。")
+    # エンコーダ凍結オプション (v13)
+    p.add_argument("--freeze_encoder",    action="store_true", default=None,
+                   help="Transformer エンコーダを凍結してタスクヘッドのみ学習する。"
+                        "バックワードパスがエンコーダを通らないため 2〜4× の高速化が得られる。"
+                        "LoRA と同時に指定した場合は LoRA が優先される。")
     return p.parse_args()
 
 
+def _set_seed(seed: int) -> None:
+    """Python / NumPy / PyTorch の乱数シードを一括固定する。"""
+    import random
+    import os
+    random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    try:
+        import numpy as np
+        np.random.seed(seed)
+    except ImportError:
+        pass
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # cuDNN の決定論的動作を有効化（速度より再現性を優先）
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
 def main() -> None:
+    # バージョン情報をログ冒頭に表示（実験結果と対応付けるため）
+    print_version_header()
+
     args = parse_args()
 
     with open(args.config, "r") as f:
@@ -105,7 +146,8 @@ def main() -> None:
     # CLI 引数で設定を上書き
     for key in ["transformer_model", "num_epochs", "batch_size",
                 "lr_transformer", "lr_task", "device",
-                "patience", "early_stopping_warmup", "gradient_accumulation_steps", "max_spans",
+                "patience", "early_stopping_warmup", "early_stopping_metric",
+                "gradient_accumulation_steps", "max_spans",
                 "type_embedding_dim", "num_distance_buckets",
                 "distance_embedding_dim", "focal_loss_gamma", "span_proj_dim"]:
         val = getattr(args, key, None)
@@ -129,8 +171,20 @@ def main() -> None:
         val = getattr(args, key, None)
         if val is not None:
             cfg[key] = val
+    # 再現性オプション
+    if args.seed is not None:
+        cfg["seed"] = args.seed
+    # エンコーダ凍結オプション (v13)
+    if args.freeze_encoder:
+        cfg["freeze_encoder"] = True
 
     logger.info("Config: %s", json.dumps(cfg, indent=2, ensure_ascii=False))
+
+    # ---- 乱数シード固定 ----
+    seed = cfg.get("seed", None)
+    if seed is not None:
+        _set_seed(seed)
+        logger.info("乱数シードを %d に固定しました (Python / NumPy / PyTorch)", seed)
 
     # ---- Tokenizer ----
     tokenizer = AutoTokenizer.from_pretrained(cfg["transformer_model"])
@@ -165,19 +219,25 @@ def main() -> None:
     )
 
     batch_size = cfg.get("batch_size", 4)
+    num_workers = cfg.get("num_workers", 0)
+    # persistent_workers=True はワーカーをエポック間で使い回す（起動コスト削減）。
+    # num_workers=0 のときは無効にしないと DataLoader が警告を出す。
+    persistent_workers = num_workers > 0
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
         shuffle=True,
         collate_fn=collate_fn,
-        num_workers=cfg.get("num_workers", 0),
+        num_workers=num_workers,
+        persistent_workers=persistent_workers,
     )
     dev_loader = DataLoader(
         dev_ds,
         batch_size=batch_size,
         shuffle=False,
         collate_fn=collate_fn,
-        num_workers=cfg.get("num_workers", 0),
+        num_workers=num_workers,
+        persistent_workers=persistent_workers,
     )
 
     # ---- Model ----
@@ -217,6 +277,10 @@ def main() -> None:
         lora_alpha=cfg.get("lora_alpha", 32),
         lora_dropout=cfg.get("lora_dropout", 0.1),
         lora_target_modules=cfg.get("lora_target_modules", None),
+        # v10: スパングラフ伝播
+        coref_prop=cfg.get("coref_prop", 1),
+        # v13: エンコーダ凍結
+        freeze_encoder=cfg.get("freeze_encoder", False),
     )
 
     # ---- Trainer ----
@@ -236,6 +300,7 @@ def main() -> None:
         use_amp=cfg.get("use_amp", False),
         patience=cfg.get("patience", 0),
         early_stopping_warmup=cfg.get("early_stopping_warmup", 20),
+        early_stopping_metric=cfg.get("early_stopping_metric", "ner_f1"),
         gradient_accumulation_steps=cfg.get("gradient_accumulation_steps", 1),
     )
 

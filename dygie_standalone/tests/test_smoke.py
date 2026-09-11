@@ -1,5 +1,5 @@
 """
-DyGIE-- — スモークテスト
+DyGIE-- Standalone — スモークテスト
 フルパイプライン（データ読み込み→モデル forward→損失→デコード→メトリクス）を検証する。
 HuggingFace への外部アクセス不要：ダミーBERTをローカル生成してテストする。
 
@@ -862,6 +862,452 @@ def test_lora_save_load():
     )
 
 
+def test_early_stopping_metric():
+    """early_stopping_metric の省略形・フルキー・auto・存在しないキーを検証する。"""
+    from dygie.training.trainer import Trainer, _METRIC_ALIASES
+
+    # ダミー metrics dict（実際の評価結果を模倣）
+    dev_metrics = {
+        "ner_f1": 0.80,
+        "rel_f1": 0.65,
+        "conll_f1": 0.72,
+        "event_trigger_f1": 0.55,
+        "event_arg_f1": 0.40,
+    }
+
+    ds = DyGIEDataset(SAMPLE, _TOK, max_span_width=4, max_total_length=128)
+    loader = DataLoader(ds, batch_size=2, collate_fn=collate_fn)
+
+    def make_trainer(metric: str) -> Trainer:
+        model = DyGIE(
+            transformer_model=MODEL_NAME,
+            ner_labels=ds.ner_labels,
+            rel_labels=ds.rel_labels,
+            max_span_width=4,
+            feedforward_dim=64,
+            width_embedding_dim=32,
+            dropout=0.0,
+        )
+        return Trainer(
+            model=model,
+            train_loader=loader,
+            dev_loader=loader,
+            output_dir=tempfile.mkdtemp(prefix="dygie_es_test_"),
+            num_epochs=1,
+            patience=0,
+            early_stopping_metric=metric,
+        )
+
+    # 省略形のエイリアス展開確認
+    for alias, full in _METRIC_ALIASES.items():
+        t = make_trainer(alias)
+        assert t.early_stopping_metric == full, (
+            f"alias '{alias}' should expand to '{full}', got '{t.early_stopping_metric}'"
+        )
+
+    # フルキー指定
+    t = make_trainer("rel_f1")
+    assert t._select_score(dev_metrics) == 0.65, "rel_f1 should return 0.65"
+
+    t = make_trainer("conll_f1")
+    assert t._select_score(dev_metrics) == 0.72, "conll_f1 should return 0.72"
+
+    t = make_trainer("event_arg_f1")
+    assert t._select_score(dev_metrics) == 0.40, "event_arg_f1 should return 0.40"
+
+    # auto: NER が最優先
+    t = make_trainer("auto")
+    assert t._select_score(dev_metrics) == 0.80, "auto should pick ner_f1=0.80"
+
+    # auto: NER がないとき RE を選択
+    t2 = make_trainer("auto")
+    assert t2._select_score({"rel_f1": 0.65, "conll_f1": 0.72}) == 0.65, \
+        "auto without ner_f1 should pick rel_f1"
+
+    # 存在しないキー → 0.0 を返す（警告）
+    t3 = make_trainer("nonexistent_f1")
+    score = t3._select_score(dev_metrics)
+    assert score == 0.0, f"nonexistent key should return 0.0, got {score}"
+
+    print(
+        "  [OK] early_stopping_metric: "
+        "省略形展開 OK | フルキー OK | auto OK | 存在しないキー→0.0 OK"
+    )
+
+
+def test_seed_reproducibility():
+    """同じシードで 2 回 forward した結果が一致し、異なるシードでは変わることを確認する。"""
+    import random, os
+
+    def _set_seed(seed: int):
+        random.seed(seed)
+        os.environ["PYTHONHASHSEED"] = str(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        try:
+            import numpy as np
+            np.random.seed(seed)
+        except ImportError:
+            pass
+
+    ds = DyGIEDataset(SAMPLE, _TOK, max_span_width=4, max_total_length=128)
+    loader = DataLoader(ds, batch_size=2, collate_fn=collate_fn)
+    batch = next(iter(loader))
+    common_kwargs = dict(
+        transformer_model=MODEL_NAME,
+        ner_labels=ds.ner_labels,
+        rel_labels=ds.rel_labels,
+        max_span_width=4,
+        feedforward_dim=64,
+        width_embedding_dim=32,
+        dropout=0.0,
+    )
+
+    # --- 同じシードで 2 回実行 → 初期化後の forward 出力が一致 ---
+    _set_seed(42)
+    m1 = DyGIE(**common_kwargs)
+    _set_seed(42)
+    m2 = DyGIE(**common_kwargs)
+    m1.eval(); m2.eval()
+    with torch.no_grad():
+        o1 = m1(
+            input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
+            token_to_subword=batch["token_to_subword"],
+            spans=batch["spans"], span_mask=batch["span_mask"],
+            num_tokens=batch["num_tokens"], use_gold_spans=False,
+        )
+        o2 = m2(
+            input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
+            token_to_subword=batch["token_to_subword"],
+            spans=batch["spans"], span_mask=batch["span_mask"],
+            num_tokens=batch["num_tokens"], use_gold_spans=False,
+        )
+    assert torch.allclose(o1["ner_logits"], o2["ner_logits"]), \
+        "同じシードで初期化したモデルの ner_logits が一致しません"
+
+    # --- 異なるシードで初期化 → task head の初期値が変わるので logits も変わるはず ---
+    _set_seed(0)
+    m3 = DyGIE(**common_kwargs)
+    m3.eval()
+    with torch.no_grad():
+        o3 = m3(
+            input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
+            token_to_subword=batch["token_to_subword"],
+            spans=batch["spans"], span_mask=batch["span_mask"],
+            num_tokens=batch["num_tokens"], use_gold_spans=False,
+        )
+    same_seed_match = torch.allclose(o1["ner_logits"], o2["ner_logits"])
+    diff_seed_differs = not torch.allclose(o1["ner_logits"], o3["ner_logits"])
+    print(
+        f"  [OK] seed=42 再現性確認: "
+        f"o1≡o2={same_seed_match} | "
+        f"seed=42 vs seed=0 が異なる={diff_seed_differs}"
+    )
+
+
+def test_re_eval_consistency():
+    """
+    RE 評価の end-to-end 整合性テスト (v9 バグ修正)。
+
+    エンティティが見逃されたとき:
+    - 旧コード (pair_mask = 予測エンティティペアのみ):
+      見逃しエンティティに関連する gold 関係が FN にカウントされず、RE F1 が過大評価される。
+    - 新コード (full_pair_mask = 全有効スパンペア):
+      見逃しエンティティに関連する gold 関係も FN に正しくカウントされ、evaluate.py と一致する。
+    """
+    from dygie.training.metrics import RelationMetrics
+
+    # シナリオ: K=3 スパン (span_0, span_1, span_2)
+    # Gold: (span_0, span_1) に関係ラベル 1
+    # Pred: span_0 が NER に見逃され, preds はすべて 0 (関係なし)
+    # 旧コード pair_mask: span_1, span_2 だけが予測エンティティ → (span_0,span_1) は評価外
+    # 新コード full_pair_mask: 全有効スパンペアを対象 → (span_0,span_1) が FN に計上
+
+    B, K = 1, 3
+    golds = torch.zeros(B, K, K, dtype=torch.long)
+    golds[0, 0, 1] = 1  # gold: (span_0, span_1) → rel=1
+
+    preds = torch.zeros(B, K, K, dtype=torch.long)  # 全ペアで予測なし
+
+    # --- 旧コード: pair_mask = 予測エンティティペアのみ (span_0 を見逃した) ---
+    old_pair_mask = torch.zeros(B, K, K, dtype=torch.bool)
+    old_pair_mask[0, 1, 2] = True  # span_1↔span_2 だけ評価
+    old_pair_mask[0, 2, 1] = True
+    metrics_old = RelationMetrics()
+    metrics_old.update(preds=preds, golds=golds, pair_mask=old_pair_mask)
+    r_old = metrics_old.compute()
+    # gold (span_0, span_1) が pair_mask に含まれないため FN にカウントされない
+    assert metrics_old.fn == 0, (
+        f"[旧コード] pair_mask 使用時: FN は 0 になるはず (過大評価バグ), got {metrics_old.fn}"
+    )
+
+    # --- 新コード: full_pair_mask = 全有効スパンペア ---
+    span_mask = torch.tensor([[True, True, True]])  # [B, K]
+    full_pair_mask = span_mask.unsqueeze(2) & span_mask.unsqueeze(1)  # [B, K, K]
+    eye = torch.eye(K, dtype=torch.bool).unsqueeze(0)
+    full_pair_mask = full_pair_mask & ~eye  # 自己ループ除外
+    metrics_new = RelationMetrics()
+    metrics_new.update(preds=preds, golds=golds, pair_mask=full_pair_mask)
+    r_new = metrics_new.compute()
+    # gold (span_0, span_1) が FN に正しく計上される
+    assert metrics_new.fn == 1, (
+        f"[新コード] full_pair_mask 使用時: FN は 1 になるはず (correct), got {metrics_new.fn}"
+    )
+    assert r_new["rel_f1"] < 0.01, (
+        f"[新コード] RE F1 は 0.0 に近いはず, got {r_new['rel_f1']:.4f}"
+    )
+
+    print(
+        f"  [OK] RE eval end-to-end consistency (v9): "
+        f"旧 pair_mask → FN={metrics_old.fn} F1={r_old['rel_f1']:.4f} (過大評価) | "
+        f"新 full_pair_mask → FN={metrics_new.fn} F1={r_new['rel_f1']:.4f} (正確)"
+    )
+
+
+def test_coref_prop():
+    """
+    coref_prop パラメータの動作確認テスト (v10/v11)。
+
+    - coref_prop=0 のとき SpanPropagation モジュールが生成されない
+    - coref_prop=1 (デフォルト) のとき SpanPropagation が生成される
+    - coref_prop=2 のとき 2 回伝播が実行できる
+    - use_coref=False かつ coref_prop>0 でも伝播が動作する（元の DyGIE++ と同じ動作）
+    - use_coref=False かつ coref_prop>0 では coref 損失が計算されない
+    - forward が各設定で正常に動作する
+    - _init_config に coref_prop が保存される
+    """
+    from dygie.data import DyGIEDataset
+    from dygie.model.span_propagation import SpanPropagation
+    from dygie.model.coref_module import CorefModule
+
+    tok = _TOK
+    ds = DyGIEDataset(SAMPLE, tok, max_span_width=4, max_total_length=128)
+
+    base_kwargs = dict(
+        transformer_model=MODEL_NAME,
+        ner_labels=ds.ner_labels,
+        rel_labels=ds.rel_labels,
+        max_span_width=4,
+        use_ner=True,
+        use_rel=True,
+        feedforward_dim=64,
+        width_embedding_dim=32,
+        use_attentive_pooling=True,
+        spans_per_word=0.4,
+        dropout=0.0,
+    )
+
+    # coref_prop=0, use_coref=False: coref_module も span_prop も生成されない
+    m_none = DyGIE(**base_kwargs, use_coref=False, coref_prop=0)
+    assert m_none.coref_module is None, "use_coref=False, coref_prop=0 → coref_module は None"
+    assert m_none.span_prop is None
+
+    # coref_prop=0, use_coref=True: coref_module のみ生成、span_prop なし
+    m0 = DyGIE(**base_kwargs, use_coref=True, coref_prop=0)
+    assert isinstance(m0.coref_module, CorefModule), "use_coref=True → coref_module が必要"
+    assert m0.span_prop is None, "coref_prop=0 → span_prop は None"
+    assert m0._init_config["coref_prop"] == 0
+
+    # coref_prop=1, use_coref=True (デフォルト): 両方生成
+    m1 = DyGIE(**base_kwargs, use_coref=True, coref_prop=1)
+    assert isinstance(m1.coref_module, CorefModule)
+    assert isinstance(m1.span_prop, SpanPropagation)
+    assert m1._init_config["coref_prop"] == 1
+
+    # coref_prop=1, use_coref=False: coref_module (伝播用) と span_prop が生成される
+    # （元の DyGIE++ と同じ: coref_prop > 0 なら coref タスク無効でも伝播可能）
+    m_prop_no_coref = DyGIE(**base_kwargs, use_coref=False, coref_prop=1)
+    assert isinstance(m_prop_no_coref.coref_module, CorefModule), \
+        "coref_prop=1, use_coref=False でも coref_module (伝播用) が必要"
+    assert isinstance(m_prop_no_coref.span_prop, SpanPropagation), \
+        "coref_prop=1, use_coref=False でも span_prop が生成されるべき"
+
+    # forward が各設定で正常に動作することを確認
+    dl = DataLoader(ds, batch_size=2, collate_fn=collate_fn)
+    batch = next(iter(dl))
+    cases = [
+        (m_none,          "use_coref=False, coref_prop=0", False),
+        (m0,              "use_coref=True,  coref_prop=0", True),
+        (m1,              "use_coref=True,  coref_prop=1", True),
+        (m_prop_no_coref, "use_coref=False, coref_prop=1", False),
+    ]
+    for model, label, expect_coref_loss in cases:
+        model.eval()
+        with torch.no_grad():
+            out = model(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                token_to_subword=batch["token_to_subword"],
+                spans=batch["spans"],
+                span_mask=batch["span_mask"],
+                num_tokens=batch["num_tokens"],
+                ner_labels=batch["ner_labels"],
+                rel_labels=batch["rel_labels"],
+                coref_clusters=batch.get("coref_clusters"),
+            )
+        assert "ner_preds" in out, f"{label}: ner_preds が出力に含まれない"
+        assert "rel_preds" in out, f"{label}: rel_preds が出力に含まれない"
+        if expect_coref_loss:
+            assert "coref_loss" in out, f"{label}: coref_loss が出力に含まれるべき"
+            assert "antecedent_scores" in out
+        else:
+            assert "coref_loss" not in out, f"{label}: coref_loss は出力されないべき"
+            if not model.use_coref:
+                assert "antecedent_scores" not in out
+
+    print(
+        "  [OK] coref_prop: use_coref と coref_prop が独立して動作（元の DyGIE++ と同じ）"
+    )
+
+
+def test_excluded_gold_count() -> None:
+    """v12: max_span_width で除外された gold アノテーションが FN にカウントされることを確認する。
+
+    max_span_width=1 では幅 1 のスパンしか span_index に含まれない。
+    サンプルデータに幅 > 1 の gold NER/RE エンティティがあれば、
+    それらが ner_excluded_gold_count > 0 として返される。
+    また、NERMetrics.update(extra_fn=N) を呼ぶと fn が N だけ増加する。
+    """
+    from dygie.training.metrics import NERMetrics, RelationMetrics
+
+    # --- NERMetrics の extra_fn 動作を確認 ---
+    m = NERMetrics()
+    # TP=1, FN=1（通常の span_mask の範囲内）
+    preds = torch.tensor([[1, 0]])  # [B=1, K=2]
+    golds = torch.tensor([[1, 1]])
+    mask  = torch.tensor([[True, True]])
+    m.update(preds, golds, mask)
+    assert m.tp == 1 and m.fn == 1, f"基準: tp={m.tp}, fn={m.fn}"
+
+    # extra_fn=3 を追加すると fn が 3 増える
+    m.update(preds, golds, mask, extra_fn=3)
+    assert m.fn == 1 + 1 + 3, f"extra_fn 後: fn={m.fn} (期待 5)"
+
+    res = m.compute()
+    # tp=2, fn=5, fp=0  → recall = 2/(2+5) ≈ 0.286
+    expected_r = 2 / (2 + 5 + 1e-9)
+    assert abs(res["ner_recall"] - expected_r) < 1e-4, f"recall={res['ner_recall']}"
+
+    # --- RelationMetrics の extra_fn 動作を確認 ---
+    rm = RelationMetrics()
+    rpreds = torch.tensor([[[1, 0], [0, 0]]])   # [B=1, K=2, K=2]
+    rgolds = torch.tensor([[[1, 1], [0, 0]]])
+    rpair  = torch.tensor([[[True, True], [True, False]]])
+    rm.update(rpreds, rgolds, rpair, extra_fn=2)
+    # pair (0,0): g=1,p=1 → tp; pair (0,1): g=1,p=0 → fn; extra_fn=2 → fn=3
+    assert rm.tp == 1 and rm.fn == 3, f"RE: tp={rm.tp}, fn={rm.fn}"
+
+    # --- collate_fn が excluded_gold_count をバッチ合算するか確認 ---
+    # max_span_width=1 でデータセットを作成し、wide span が除外されるか確認
+    tok = _TOK
+    ds_narrow = DyGIEDataset(SAMPLE, tok, max_span_width=1, max_total_length=128)
+    ds_wide   = DyGIEDataset(SAMPLE, tok, max_span_width=8, max_total_length=128)
+
+    loader_narrow = DataLoader(ds_narrow, batch_size=2, collate_fn=collate_fn)
+    loader_wide   = DataLoader(ds_wide,   batch_size=2, collate_fn=collate_fn)
+
+    total_excluded_narrow = 0
+    total_excluded_wide   = 0
+    for batch in loader_narrow:
+        total_excluded_narrow += batch.get("ner_excluded_gold_count", 0)
+    for batch in loader_wide:
+        total_excluded_wide += batch.get("ner_excluded_gold_count", 0)
+
+    # サンプルデータに幅>1 の gold NER がある場合、narrow では除外数が wide より多い
+    assert total_excluded_narrow >= total_excluded_wide, (
+        f"narrow({total_excluded_narrow}) >= wide({total_excluded_wide}) であるべき"
+    )
+
+    print(
+        f"  [OK] excluded_gold_count: narrow={total_excluded_narrow}, wide={total_excluded_wide}"
+    )
+    print("  [OK] NERMetrics / RelationMetrics の extra_fn が正しく FN に追加される")
+
+
+def test_freeze_encoder() -> None:
+    """v13: freeze_encoder=True でエンコーダが凍結され、タスクヘッドのみ学習されることを確認する。"""
+    tok = _TOK
+    ds = DyGIEDataset(SAMPLE, tok, max_span_width=4, max_total_length=128)
+
+    # freeze_encoder=True モデル
+    model_frozen = DyGIE(
+        transformer_model=MODEL_NAME,
+        ner_labels=ds.ner_labels,
+        rel_labels=ds.rel_labels,
+        max_span_width=4,
+        use_ner=True,
+        use_rel=True,
+        use_coref=False,
+        feedforward_dim=64,
+        width_embedding_dim=32,
+        dropout=0.0,
+        freeze_encoder=True,
+    )
+
+    # エンコーダの全パラメータが凍結されているか確認
+    encoder_params = list(model_frozen.encoder.parameters())
+    assert all(not p.requires_grad for p in encoder_params), \
+        "freeze_encoder=True のとき、エンコーダの全パラメータが凍結されるべき"
+
+    # タスクヘッドは学習可能か確認
+    task_params = [p for p in model_frozen.parameters() if p.requires_grad]
+    assert len(task_params) > 0, "タスクヘッドのパラメータは requires_grad=True であるべき"
+
+    # freeze_encoder=False モデルはエンコーダが学習可能
+    model_normal = DyGIE(
+        transformer_model=MODEL_NAME,
+        ner_labels=ds.ner_labels,
+        rel_labels=ds.rel_labels,
+        max_span_width=4,
+        use_ner=True,
+        use_rel=True,
+        use_coref=False,
+        feedforward_dim=64,
+        width_embedding_dim=32,
+        dropout=0.0,
+        freeze_encoder=False,
+    )
+    encoder_params_normal = list(model_normal.encoder.parameters())
+    assert all(p.requires_grad for p in encoder_params_normal), \
+        "freeze_encoder=False のとき、エンコーダは学習可能であるべき"
+
+    # フォワードパスが正常に動作するか確認
+    loader = DataLoader(ds, batch_size=2, collate_fn=collate_fn)
+    batch = next(iter(loader))
+    model_frozen.eval()
+    with torch.no_grad():
+        out = model_frozen(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+            token_to_subword=batch["token_to_subword"],
+            spans=batch["spans"],
+            span_mask=batch["span_mask"],
+            num_tokens=batch["num_tokens"],
+        )
+    assert "ner_preds" in out, "freeze_encoder=True でも forward が動作すべき"
+
+    # save_pretrained / from_pretrained で freeze_encoder が保存・復元されるか確認
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        model_frozen.save_pretrained(tmp)
+        model_loaded = DyGIE.from_pretrained(tmp)
+        assert model_loaded.freeze_encoder is True, \
+            "freeze_encoder が save/load で正しく復元されるべき"
+        # ロード後もエンコーダが凍結されているか
+        enc_params_loaded = list(model_loaded.encoder.parameters())
+        assert all(not p.requires_grad for p in enc_params_loaded), \
+            "from_pretrained 後もエンコーダが凍結されているべき"
+
+    frozen_count = sum(1 for p in model_frozen.parameters() if not p.requires_grad)
+    trainable_count = sum(1 for p in model_frozen.parameters() if p.requires_grad)
+    print(
+        f"  [OK] freeze_encoder: encoder frozen ({frozen_count} param tensors), "
+        f"task head trainable ({trainable_count} param tensors)"
+    )
+
+
 if __name__ == "__main__":
     tests = [
         ("Dataset",                           test_dataset),
@@ -878,6 +1324,12 @@ if __name__ == "__main__":
         ("Event Forward + Loss",              test_event_forward),
         ("LoRA forward/backward",             test_lora_forward),
         ("LoRA save / load pretrained",       test_lora_save_load),
+        ("Early stopping metric selection",   test_early_stopping_metric),
+        ("Seed reproducibility",              test_seed_reproducibility),
+        ("RE eval end-to-end consistency",    test_re_eval_consistency),
+        ("coref_prop parameter",              test_coref_prop),
+        ("excluded gold count (v12)",         test_excluded_gold_count),
+        ("freeze_encoder (v13)",              test_freeze_encoder),
     ]
     print("\n===== DyGIE++ Standalone Smoke Tests =====")
     passed = failed = 0

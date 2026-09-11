@@ -1,2 +1,2 @@
 """DyGIE++ Standalone — AllenNLP-free reimplementation."""
-__version__ = "1.0.0"
+from dygie.version import __version__, print_version_header  # noqa: F401

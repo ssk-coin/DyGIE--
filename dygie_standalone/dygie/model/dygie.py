@@ -1,5 +1,5 @@
 """
-DyGIE-- — メインモデル
+DyGIE-- Standalone — メインモデル
 
 Transformer エンコーダ + スパン抽出 + NER / RE / Coref ヘッドを統合します。
 AllenNLP には一切依存しません。
@@ -115,6 +115,12 @@ class DyGIE(nn.Module):
     lora_target_modules : list[str] | None
         LoRA を適用する BERT のモジュール名。
         None のとき BERT/SciBERT デフォルト ["query", "value"] を使用。
+    coref_prop : int
+        スパングラフ伝播（DyGIE++ Section 3.3）の反復回数。
+        0 のとき伝播なし（SpanPropagation モジュールを生成しない）。
+        1 以上のとき coref antecedent scores を辺として GRU スタイルで
+        span_repr を coref_prop 回繰り返し更新する。
+        元論文の設定: 1。use_coref=False のときは無視される。
     """
 
     def __init__(
@@ -153,6 +159,10 @@ class DyGIE(nn.Module):
         lora_alpha: int = 32,
         lora_dropout: float = 0.1,
         lora_target_modules: list[str] | None = None,
+        # スパングラフ伝播 (v10)
+        coref_prop: int = 1,
+        # エンコーダ凍結 (v13)
+        freeze_encoder: bool = False,
     ) -> None:
         super().__init__()
 
@@ -160,6 +170,7 @@ class DyGIE(nn.Module):
         self.use_rel = use_rel
         self.use_coref = use_coref
         self.use_event = use_event
+        self.coref_prop = coref_prop
         self.ner_loss_weight = ner_loss_weight
         self.rel_loss_weight = rel_loss_weight
         self.coref_loss_weight = coref_loss_weight
@@ -206,6 +217,10 @@ class DyGIE(nn.Module):
             "lora_alpha": lora_alpha,
             "lora_dropout": lora_dropout,
             "lora_target_modules": lora_target_modules or ["query", "value"],
+            # v10: スパングラフ伝播
+            "coref_prop": coref_prop,
+            # v13: エンコーダ凍結
+            "freeze_encoder": freeze_encoder,
         }
 
         # ---- Transformer encoder ----
@@ -239,6 +254,25 @@ class DyGIE(nn.Module):
                 "trainable params: %d / %d (%.2f%%)",
                 lora_r, lora_alpha, _target_modules,
                 trainable, total, 100 * trainable / max(total, 1),
+            )
+
+        # ---- エンコーダ凍結 (v13) ----
+        # Transformer エンコーダの全パラメータを凍結し、タスクヘッドのみ学習する。
+        # バックワードパスでエンコーダを通らないため大幅な高速化（2〜4×）が得られる。
+        # LoRA と同時に指定した場合は LoRA が優先（LoRA の A/B 行列は requires_grad=True）。
+        self.freeze_encoder = freeze_encoder
+        if freeze_encoder and not use_lora:
+            for param in self.encoder.parameters():
+                param.requires_grad = False
+            logger.info(
+                "Encoder frozen: all %d encoder parameters set to requires_grad=False.",
+                sum(p.numel() for p in self.encoder.parameters()),
+            )
+        elif freeze_encoder and use_lora:
+            logger.warning(
+                "freeze_encoder=True と use_lora=True が同時に指定されました。"
+                "LoRA が優先されます（LoRA アダプタのみ学習）。"
+                "freeze_encoder の効果は LoRA に吸収されているため無視します。"
             )
 
         # 勾配チェックポイント: エンコーダの活性化メモリを 50〜70% 削減
@@ -286,7 +320,10 @@ class DyGIE(nn.Module):
         else:
             self.rel_module = None  # type: ignore
 
-        if use_coref:
+        # CorefModule は use_coref=True（coref タスク）または coref_prop > 0（伝播のみ使用）
+        # のどちらかで生成する。伝播には antecedent scores が必要なため。
+        # use_coref=False かつ coref_prop=0 のときのみ生成しない。
+        if use_coref or coref_prop > 0:
             self.coref_module = CorefModule(
                 span_dim=span_dim,
                 feedforward_dim=feedforward_dim,
@@ -294,11 +331,15 @@ class DyGIE(nn.Module):
                 max_top_antecedents=max_top_antecedents,
                 dropout=dropout,
             )
-            # スパングラフ伝播: Coref クラスタを辺として NER/RE 前に span_repr を更新
-            # (DyGIE++ 論文 Section 3.3 / Wadden et al., 2019)
-            self.span_prop = SpanPropagation(span_dim=span_dim, dropout=dropout)
         else:
             self.coref_module = None  # type: ignore
+
+        # スパングラフ伝播: coref_prop > 0 のときのみ有効（use_coref とは独立）
+        # (DyGIE++ 論文 Section 3.3 / Wadden et al., 2019)
+        # coref_prop は伝播の反復回数。0 で無効、1 以上で coref_prop 回繰り返す。
+        if coref_prop > 0:
+            self.span_prop = SpanPropagation(span_dim=span_dim, dropout=dropout)
+        else:
             self.span_prop = None  # type: ignore
 
         # ---- イベント抽出ヘッド ----
@@ -406,6 +447,8 @@ class DyGIE(nn.Module):
         # ====================================================================
 
         # ---- Phase 1: Coref compute_representations ----
+        # use_coref=True（coref タスク）または coref_prop > 0（伝播のみ）のとき実行する。
+        # antecedent_scores は Phase 2 の SpanPropagation でも使用する。
         coref_repr: dict[str, Any] | None = None
         if self.coref_module is not None:
             coref_repr = self.coref_module.compute_representations(
@@ -414,22 +457,26 @@ class DyGIE(nn.Module):
                 spans=spans,
                 num_tokens=num_tokens,
             )
-            # antecedent_scores は SpanProp と出力に使用（損失はまだ計算しない）
-            output["mention_scores"]    = coref_repr["mention_scores"]
-            output["top_span_indices"]  = coref_repr["top_span_indices"]
-            output["top_span_mask"]     = coref_repr["top_span_mask"]
-            output["antecedent_scores"] = coref_repr["antecedent_scores"]
+            # mention_scores / antecedent_scores は coref タスクが有効なときのみ出力する
+            if self.use_coref:
+                output["mention_scores"]    = coref_repr["mention_scores"]
+                output["top_span_indices"]  = coref_repr["top_span_indices"]
+                output["top_span_mask"]     = coref_repr["top_span_mask"]
+                output["antecedent_scores"] = coref_repr["antecedent_scores"]
 
         # ---- Phase 2: Span Graph Propagation (Section 3.3) ----
-        # Coref antecedent scores を辺として GRU スタイルでスパン表現を更新する。
+        # coref_prop > 0 のとき、coref antecedent scores を辺として GRU スタイルで
+        # スパン表現を coref_prop 回繰り返し更新する。
         # 同一エンティティの複数スパン間で情報を共有し、NER・RE の精度を向上させる。
-        if self.span_prop is not None and coref_repr is not None:
-            span_repr = self.span_prop(
-                span_repr=span_repr,
-                top_span_indices=coref_repr["top_span_indices"],
-                top_span_mask=coref_repr["top_span_mask"],
-                antecedent_scores=coref_repr["antecedent_scores"],
-            )
+        # coref_prop == 0 のとき伝播なし（元の DyGIE++ の "no propagation" 設定に相当）。
+        if self.coref_prop > 0 and self.span_prop is not None and coref_repr is not None:
+            for _ in range(self.coref_prop):
+                span_repr = self.span_prop(
+                    span_repr=span_repr,
+                    top_span_indices=coref_repr["top_span_indices"],
+                    top_span_mask=coref_repr["top_span_mask"],
+                    antecedent_scores=coref_repr["antecedent_scores"],
+                )
 
         # ---- Phase 3: NER (伝播後の span_repr を使用) ----
         if self.ner_module is not None:
@@ -448,7 +495,9 @@ class DyGIE(nn.Module):
 
         # ---- Phase 4: coref.predict_labels (NER の後・RE の前) ----
         # 原論文の順序に従い、クラスタ割り当てと coref 損失計算を NER の後に実行する。
-        if self.coref_module is not None and coref_repr is not None:
+        # use_coref=False かつ coref_prop > 0 の場合は coref_module が伝播用に
+        # 存在するが、損失は計算しない（タスクとして有効でないため）。
+        if self.use_coref and self.coref_module is not None and coref_repr is not None:
             coref_repr = self.coref_module.predict_labels(
                 coref_repr=coref_repr,
                 spans=spans,

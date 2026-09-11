@@ -1,5 +1,5 @@
 """
-DyGIE-- — Trainer
+DyGIE-- Standalone — Trainer
 
 AllenNLP の Trainer を置き換える純粋な PyTorch 学習ループ。
 
@@ -16,6 +16,28 @@ AllenNLP の Trainer を置き換える純粋な PyTorch 学習ループ。
   - Gradient accumulation サポート (gradient_accumulation_steps > 1 で有効)
   - Early stopping ウォームアップ: early_stopping_warmup エポック中は
     patience カウンタを増加させず、安定前の停止を防ぐ
+
+改善点 (v8):
+  - early_stopping_metric: early stopping の判定に使うメトリクスを設定可能
+
+バグ修正 (v9):
+  - _evaluate() の RE / Event 引数メトリクスを end-to-end 評価に統一。
+    従来は model が出力した pair_mask（予測エンティティペアのみ）を使用していたため、
+    エンティティを見逃したペアの gold 関係が FN にカウントされず、
+    trainer の RE F1 が evaluate.py の値より高く表示される問題があった。
+    修正後は全有効スパンペアを対象とした full_pair_mask を使用し、
+    予測エンティティ外の gold 関係も FN として正しくカウントする。
+    これにより trainer の評価スコアが evaluate.py と一致するようになった。
+
+バグ修正 (v12):
+  - max_span_width によって除外された gold アノテーションが FN にカウントされない問題を修正。
+    max_span_width=1 などの小さい値で学習した場合、gold NER/RE/Event アノテーションのうち
+    スパン幅が max_span_width を超えるものは span_index に存在しないため、
+    label テンソルに格納されず（ゼロ埋め）、FN としてカウントされなかった。
+    これにより recall が人為的に高く表示される問題があった。
+    修正後は dataset.py で除外された gold 数をカウントし、
+    collate_fn でバッチ合計し、metrics.update() の extra_fn に渡して
+    FN として正しくカウントする。
 """
 
 from __future__ import annotations
@@ -36,6 +58,14 @@ from ..model.dygie import DyGIE
 from .metrics import NERMetrics, RelationMetrics, CorefMetrics, EventMetrics
 
 logger = logging.getLogger(__name__)
+
+# early stopping メトリクス省略形 → フルキー
+_METRIC_ALIASES: dict[str, str] = {
+    "ner":   "ner_f1",
+    "rel":   "rel_f1",
+    "coref": "conll_f1",
+    "event": "event_trigger_f1",
+}
 
 
 class Trainer:
@@ -69,6 +99,12 @@ class Trainer:
         Early stopping を有効化するまでのウォームアップエポック数（デフォルト 20）。
         最初のこのエポック数の間は patience カウンタを増加させない。
         学習初期のスコアが不安定な期間に誤って停止するのを防ぐ。
+    early_stopping_metric : str
+        Early stopping の判定に使うメトリクスキー（デフォルト "ner_f1"）。
+        省略形: "ner"→"ner_f1", "rel"→"rel_f1", "coref"→"conll_f1",
+                "event"→"event_trigger_f1"。
+        "auto" を指定すると有効タスクから自動選択（NER > RE > Coref > Event の優先順）。
+        フルキーも指定可: "rel_f1", "conll_f1", "event_arg_f1" など。
     gradient_accumulation_steps : int
         勾配蓄積ステップ数。1 で通常通り毎ステップ更新。
         メモリが少ない環境で実効バッチサイズを増やすために使用する。
@@ -91,6 +127,7 @@ class Trainer:
         use_amp: bool = False,
         patience: int = 0,
         early_stopping_warmup: int = 20,
+        early_stopping_metric: str = "ner_f1",
         gradient_accumulation_steps: int = 1,
     ) -> None:
         self.model = model
@@ -104,6 +141,10 @@ class Trainer:
         self.log_every = log_every
         self.patience = patience
         self.early_stopping_warmup = max(0, early_stopping_warmup)
+        # 省略形をフルキーに展開（"ner" → "ner_f1" など）
+        self.early_stopping_metric = _METRIC_ALIASES.get(
+            early_stopping_metric, early_stopping_metric
+        )
         self.gradient_accumulation_steps = max(1, gradient_accumulation_steps)
 
         # device
@@ -155,6 +196,7 @@ class Trainer:
         # metrics
         self.ner_metrics = NERMetrics()
         self.rel_metrics = RelationMetrics()
+        self.rel_metrics_gold = RelationMetrics()   # gold NER スパンを使った RE 評価（診断用）
         self.coref_metrics = CorefMetrics()
         self.event_metrics = EventMetrics()
 
@@ -173,8 +215,8 @@ class Trainer:
             dev_metrics = self._evaluate(self.dev_loader)
             elapsed = time.time() - t0
 
-            # 主要スコア（NER F1 を優先、なければ RE F1）
-            score = dev_metrics.get("ner_f1", dev_metrics.get("rel_f1", 0.0))
+            # early stopping 判定スコアの選択
+            score = self._select_score(dev_metrics)
 
             record = {
                 "epoch": epoch,
@@ -190,7 +232,7 @@ class Trainer:
                 self.best_dev_score = score
                 self._patience_counter = 0
                 self._save_checkpoint("best")
-                logger.info("  ↑ New best score: %.4f", score)
+                logger.info("  ↑ New best %s: %.4f", self.early_stopping_metric, score)
             else:
                 # ウォームアップ期間中は patience カウンタを増加させない
                 if epoch > self.early_stopping_warmup:
@@ -217,9 +259,10 @@ class Trainer:
                 and self._patience_counter >= self.patience
             ):
                 logger.info(
-                    "Early stopping triggered at epoch %d (patience=%d, warmup=%d). "
-                    "Best score: %.4f",
-                    epoch, self.patience, self.early_stopping_warmup, self.best_dev_score,
+                    "Early stopping triggered at epoch %d "
+                    "(metric=%s, patience=%d, warmup=%d). Best score: %.4f",
+                    epoch, self.early_stopping_metric,
+                    self.patience, self.early_stopping_warmup, self.best_dev_score,
                 )
                 break
 
@@ -234,6 +277,30 @@ class Trainer:
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
+
+    def _select_score(self, dev_metrics: dict[str, float]) -> float:
+        """early_stopping_metric に従い dev_metrics からスコアを取得する。
+
+        "auto" の場合は有効タスクから NER > RE > Coref > Event の優先順で選択する。
+        指定したキーが dev_metrics に存在しない場合は警告を出し 0.0 を返す。
+        """
+        if self.early_stopping_metric == "auto":
+            # 有効タスクを優先順で確認
+            for key in ("ner_f1", "rel_f1", "conll_f1", "event_trigger_f1"):
+                if key in dev_metrics:
+                    return dev_metrics[key]
+            return 0.0
+
+        if self.early_stopping_metric not in dev_metrics:
+            available = list(dev_metrics.keys())
+            logger.warning(
+                "early_stopping_metric='%s' が dev_metrics にありません。"
+                "利用可能なキー: %s。0.0 を使用します。",
+                self.early_stopping_metric, available,
+            )
+            return 0.0
+
+        return dev_metrics[self.early_stopping_metric]
 
     def _train_epoch(self, epoch: int) -> float:
         self.model.train()
@@ -306,6 +373,7 @@ class Trainer:
         self.model.eval()
         self.ner_metrics.reset()
         self.rel_metrics.reset()
+        self.rel_metrics_gold.reset()
         self.coref_metrics.reset()
         self.event_metrics.reset()
 
@@ -321,19 +389,59 @@ class Trainer:
                 use_gold_spans=False,  # 推論時は predicted NER / trigger を使用
             )
 
+            # ---- gold NER 条件での RE 評価（診断用） ----
+            # DyGIE++ 論文が報告する RE F1 は gold NER スパンを使う場合が多い。
+            # ここでは gold NER スパンを強制使用した RE 予測を別途評価し
+            # end-to-end RE F1 との乖離を可視化する。
+            outputs_gold_ner = None
+            if self.model.use_rel:
+                with torch.no_grad():
+                    outputs_gold_ner = self.model(
+                        input_ids=batch["input_ids"],
+                        attention_mask=batch["attention_mask"],
+                        token_to_subword=batch["token_to_subword"],
+                        spans=batch["spans"],
+                        span_mask=batch["span_mask"],
+                        num_tokens=batch["num_tokens"],
+                        use_gold_spans=True,
+                        ner_labels=batch.get("ner_labels"),
+                        rel_labels=None,        # 損失は不要
+                    )
+
             if self.model.use_ner and "ner_preds" in outputs:
                 self.ner_metrics.update(
                     preds=outputs["ner_preds"].cpu(),
                     golds=batch["ner_labels"].cpu(),
                     span_mask=batch["span_mask"].cpu(),
+                    # max_span_width で除外された gold エンティティを FN に追加
+                    extra_fn=batch.get("ner_excluded_gold_count", 0),
                 )
 
             if self.model.use_rel and "rel_preds" in outputs:
+                # end-to-end RE 評価: 予測エンティティペアだけでなく
+                # 全有効スパンペアを対象とする（evaluate.py との整合）。
+                # rel_preds は非エンティティペアについて 0 が格納済みなので、
+                # full_pair_mask を使うと missed entity による gold 関係も FN に計上される。
+                sm = batch["span_mask"].cpu()
+                K_size = sm.size(1)
+                full_pair_mask = sm.unsqueeze(2) & sm.unsqueeze(1)   # [B, K, K]
+                eye = torch.eye(K_size, dtype=torch.bool).unsqueeze(0)
+                full_pair_mask = full_pair_mask & ~eye                # 自己ループ除外
+                extra_fn = batch.get("rel_excluded_gold_count", 0)
                 self.rel_metrics.update(
                     preds=outputs["rel_preds"].cpu(),
                     golds=batch["rel_labels"].cpu(),
-                    pair_mask=outputs["pair_mask"].cpu(),
+                    pair_mask=full_pair_mask,
+                    extra_fn=extra_fn,
                 )
+                # gold NER 条件での RE 評価（診断用）
+                if outputs_gold_ner is not None and "rel_preds" in outputs_gold_ner:
+                    self.rel_metrics_gold.update(
+                        preds=outputs_gold_ner["rel_preds"].cpu(),
+                        golds=batch["rel_labels"].cpu(),
+                        pair_mask=full_pair_mask,
+                        extra_fn=extra_fn,
+                    )
 
             if self.model.use_coref and "top_span_indices" in outputs:
                 for b in range(batch["input_ids"].size(0)):
@@ -349,13 +457,22 @@ class Trainer:
                     )
 
             if self.model.use_event and "event_trigger_preds" in outputs:
+                # end-to-end Event 引数評価: 予測トリガーペアだけでなく
+                # 全有効スパンペアを対象とする（evaluate.py との整合）。
+                # event_arg_preds は非トリガースパンについて 0 が格納済みなので、
+                # full_pair_mask を使うと missed trigger による gold 引数も FN に計上される。
+                sm = batch["span_mask"].cpu()
+                full_arg_mask = sm.unsqueeze(2) & sm.unsqueeze(1)    # [B, K, K]
                 self.event_metrics.update(
                     trigger_preds=outputs["event_trigger_preds"].cpu(),
                     trigger_golds=batch["event_trigger_labels"].cpu(),
                     arg_preds=outputs["event_arg_preds"].cpu(),
                     arg_golds=batch["event_arg_labels"].cpu(),
-                    span_mask=batch["span_mask"].cpu(),
-                    arg_mask=outputs["event_arg_mask"].cpu(),
+                    span_mask=sm,
+                    arg_mask=full_arg_mask,
+                    # max_span_width で除外された gold イベントを FN に追加
+                    extra_trigger_fn=batch.get("event_trigger_excluded_gold_count", 0),
+                    extra_arg_fn=batch.get("event_arg_excluded_gold_count", 0),
                 )
 
         metrics: dict[str, float] = {}
@@ -363,6 +480,11 @@ class Trainer:
             metrics.update(self.ner_metrics.compute())
         if self.model.use_rel:
             metrics.update(self.rel_metrics.compute())
+            # gold NER 条件での RE F1 を "rel_f1_gold_ner" として追加（診断用）
+            gold_rel = self.rel_metrics_gold.compute()
+            metrics["rel_f1_gold_ner"] = gold_rel["rel_f1"]
+            metrics["rel_precision_gold_ner"] = gold_rel["rel_precision"]
+            metrics["rel_recall_gold_ner"]    = gold_rel["rel_recall"]
         if self.model.use_coref:
             metrics.update(self.coref_metrics.compute())
         if self.model.use_event:

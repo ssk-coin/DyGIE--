@@ -6,6 +6,8 @@
   "use_ner":   true,
   "use_rel":   true,
   "use_coref": true,
+  "coref_prop": 1,
+  "_comment_coref_prop": "スパングラフ伝播の反復回数（DyGIE++ Section 3.3）。0 で無効、1 以上で coref_prop 回繰り返す。元論文の設定: 1。use_coref=false のときは無視される。",
 
   "ner_loss_weight":   1.0,
   "rel_loss_weight":   1.0,
@@ -38,6 +40,9 @@
   "early_stopping_warmup": 20,
   "_comment_early_stopping_warmup": "Early stopping を開始するまでのウォームアップエポック数。最初のこのエポック数の間は patience カウンタを増加させない。学習初期のスコアが不安定な期間に誤って停止するのを防ぐ。",
 
+  "early_stopping_metric": "ner_f1",
+  "_comment_early_stopping_metric": "Early stopping の判定に使うメトリクス。省略形: 'ner'=ner_f1, 'rel'=rel_f1, 'coref'=conll_f1, 'event'=event_trigger_f1。フルキーも指定可: 'event_arg_f1' など。'auto' で有効タスクから自動選択（NER > RE > Coref > Event 優先）。",
+
   "gradient_accumulation_steps": 1,
   "_comment_gradient_accumulation_steps": "勾配蓄積ステップ数。バッチサイズを増やせない場合に実効バッチサイズを増やす。例: 4 なら実効バッチサイズは batch_size × 4。",
 
@@ -67,7 +72,12 @@
   "_comment_focal_loss_gamma": "RE Focal Loss の gamma パラメータ。0 で通常の CrossEntropyLoss。2.0 が標準的な値。SciERC の RE は「関係なし」が多数派のため focal loss が効果的。",
 
   "span_proj_dim": 512,
-  "_comment_span_proj_dim": "RE ペア計算前に span_repr を射影する次元数。小さいほど高速・省メモリ（情報損失リスクあり）。大きいほど表現力が向上。目安: 256=高速、512=バランス（デフォルト）、768=BERT hidden dim 相当。0 を指定すると span_proj を使わず span_dim をそのまま使う（非推奨）。",
+  "_comment_span_proj_dim": "RE ペア計算前に span_repr を射影する次元数。小さいほど高速・省メモリ（情報損失リスクあり）。大きいほど表現力が向上。目安: 256=高速、512=バランス（デフォルト）、768=BERT hidden dim 相当。0 を指定すると射影なし（非推奨）。",
+
+  "_comment_freeze": "=== エンコーダ凍結オプション (v13) ===",
+
+  "freeze_encoder": false,
+  "_comment_freeze_encoder": "true にすると Transformer エンコーダ全体を凍結し、タスクヘッドのみ学習する。バックワードパスがエンコーダを通らないため 2〜4× 高速化される。use_lora=true と同時に指定した場合は LoRA が優先（LoRA アダプタのみ学習）。",
 
   "_comment_lora": "=== LoRA アダプタ オプション (v6) ===",
 
@@ -85,6 +95,11 @@
 
   "lora_target_modules": ["query", "value"],
   "_comment_lora_target_modules": "LoRA を適用する BERT のモジュール名。['query', 'value'] が標準。['query', 'key', 'value', 'dense'] まで広げると表現力が上がる。",
+
+  "_comment_seed": "=== 再現性オプション (v7) ===",
+
+  "seed": 42,
+  "_comment_seed_detail": "Python / NumPy / PyTorch の乱数シードを一括固定する。cuDNN も deterministic モードになる（速度より再現性を優先）。null または キーなし で固定しない。",
 
   "_comment_ner_labels": "自動収集されます。手動指定したい場合は下記のコメントを外してください。",
   "_ner_labels_example": ["Task", "Method", "Metric", "Material", "OtherScientificTerm", "Generic"],
