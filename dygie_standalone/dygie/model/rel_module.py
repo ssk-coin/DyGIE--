@@ -34,6 +34,8 @@ RE スコア改善 (v4):
      → 難しい正例に損失を集中 (gamma=2.0 推奨)
   4. 深い Pair MLP: 2 層 + LayerNorm で表現力向上
   5. 損失集約の修正: バッチアイテムごとの平均 → 全ペアを集約した単一 CE
+  6. 論文準拠: DyGIE++ h_ij = f([g_i; g_j; g_i⊙g_j; φ(τ_i); φ(τ_j)]) の
+     要素積 g_i⊙g_j を pair 表現に追加（スパン間相互作用パターンの直接学習）
 """
 
 from __future__ import annotations
@@ -185,8 +187,10 @@ class RelationModule(nn.Module):
             self.span_proj = nn.Identity()  # type: ignore
 
         # ---- Pair MLP: 2 層 + LayerNorm ----
-        # ペア入力: [src_proj; tgt_proj; src_type; tgt_type; dist_emb]
-        pair_input_dim = self._proj_dim * 2 + type_feat_dim + dist_feat_dim
+        # DyGIE++ 論文: h_ij = f([g_i; g_j; g_i⊙g_j; φ(τ_i); φ(τ_j)])
+        # ペア入力: [src_proj; tgt_proj; src_proj⊙tgt_proj; src_type; tgt_type; dist_emb]
+        # 要素積（⊙）でスパン間相互作用パターンを直接学習できる（論文準拠）。
+        pair_input_dim = self._proj_dim * 3 + type_feat_dim + dist_feat_dim
         self.pair_mlp = nn.Sequential(
             nn.Linear(pair_input_dim, feedforward_dim),
             nn.LayerNorm(feedforward_dim),
@@ -256,9 +260,11 @@ class RelationModule(nn.Module):
             e_proj = proj[b].index_select(0, e_idx)
 
             # ---- ペア表現の構築 ----
-            src = e_proj.unsqueeze(1).expand(-1, E, -1)    # [E, E, ff_dim]
-            tgt = e_proj.unsqueeze(0).expand(E, -1, -1)    # [E, E, ff_dim]
-            parts = [src, tgt]
+            # DyGIE++ 論文: h_ij = f([g_i; g_j; g_i⊙g_j; φ(τ_i); φ(τ_j)])
+            src = e_proj.unsqueeze(1).expand(-1, E, -1)    # [E, E, proj_dim]
+            tgt = e_proj.unsqueeze(0).expand(E, -1, -1)    # [E, E, proj_dim]
+            interaction = src * tgt                         # [E, E, proj_dim] 要素積
+            parts = [src, tgt, interaction]
 
             # エンティティタイプ埋め込み [E, E, type_emb_dim] × 2
             if self.use_type_embedding:
